@@ -365,6 +365,22 @@ fn fast_defaults() {
         ("VICTORY_FAULT_TRACK", "1"),
         ("VICTORY_LAZY_BACK", "1"),
         ("VICTORY_BACK_ON_DEMAND", "1"),
+        // The best measured set (about 150 ms a frame standing still on an
+        // RTX A4500 with 4 cores, against 204-234 ms before it), so that a
+        // plain `victory run` uses it. Each can be turned off with its
+        // variable.
+        ("VICTORY_SHADER_CACHE_KEY", "shaders-1125f"),
+        ("VICTORY_GPU_BACK_MAX_KB", "1024"),
+        ("VICTORY_LATE_WAIT_LISTS", "512"),
+        ("VICTORY_ASYNC_SUBMIT", "1"),
+        ("VICTORY_ASYNC_PRESENT", "1"),
+        ("VICTORY_MERGE_RUNS", "65536"),
+        ("VICTORY_QUEUE2", "1"),
+        ("VICTORY_FILL_NO_WAIT", "1"),
+        ("VICTORY_REUSE_IDLE", "1"),
+        ("VICTORY_VIEW_KNOWN", "1"),
+        ("VICTORY_CLAMP_SCOPED", "1"),
+        ("VICTORY_BARRIER_MERGE", "1"),
     ];
     for (name, value) in FAST {
         if std::env::var_os(name).is_none() {
