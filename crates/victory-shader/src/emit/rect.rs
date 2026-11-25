@@ -414,6 +414,8 @@ mod tests {
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
+            address_map: false,
+            descriptor_words: false,
             root_indexed_views: Vec::new(),
         };
         (

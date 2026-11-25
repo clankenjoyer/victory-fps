@@ -72,7 +72,9 @@ pub(crate) fn signature(elements: &[SigElement], input: bool) -> Vec<u8> {
     // Validator 1.6 writes one name per element in element order, repeats
     // included, except that system values share theirs (it keys names by
     // the semantic's string, which is one static string per system value);
-    // the rows sorted by register (unallocated last).
+    // the rows sorted by register (unallocated last), then by name offset
+    // (so elements sharing a register keep the element order, as the
+    // validator sorts them, whatever their columns).
     let mut offsets: Vec<u32> = Vec::new();
     let mut next = 8 + 32 * elements.len() as u32;
     let mut names = Vec::new();
@@ -90,7 +92,7 @@ pub(crate) fn signature(elements: &[SigElement], input: bool) -> Vec<u8> {
         }
     }
     let mut order: Vec<usize> = (0..elements.len()).collect();
-    order.sort_by_key(|&i| (elements[i].row.unwrap_or(u32::MAX), elements[i].col));
+    order.sort_by_key(|&i| (elements[i].row.unwrap_or(u32::MAX), offsets[i], elements[i].col));
     for i in order {
         let (e, offset) = (&elements[i], offsets[i]);
         let used = e.usage << e.col;
@@ -141,6 +143,8 @@ pub(crate) struct Binding {
     pub register: u32,
     /// DXIL resource kind (13 cbuffer, 14 sampler).
     pub dxil_kind: u32,
+    /// Registers in the range (1 but for a sampler range).
+    pub count: u32,
 }
 
 pub(crate) struct Psv<'a> {
@@ -161,9 +165,12 @@ pub(crate) struct Psv<'a> {
     /// Compute: thread-group size and required wave size.
     pub threads: [u32; 3],
     pub wave_size: Option<u32>,
+    /// Runtime info version 3 (validator 1.8), which names the entry
+    /// function; version 2 (validator 1.6) otherwise.
+    pub v3: bool,
 }
 
-/// `PSV0` with runtime info version 2 (validator 1.6).
+/// `PSV0` with runtime info version 2 (validator 1.6) or 3 (1.8).
 pub(crate) fn psv(p: &Psv) -> Vec<u8> {
     let vectors = |els: &[SigElement]| {
         els.iter()
@@ -179,8 +186,11 @@ pub(crate) fn psv(p: &Psv) -> Vec<u8> {
             out.extend(v.to_le_bytes());
         }
     };
-    u32s(&mut out, &[48]);
-    let mut info = [0u8; 48];
+    let size = if p.v3 { 52 } else { 48 };
+    u32s(&mut out, &[size as u32]);
+    let mut info = [0u8; 52];
+    // Version 3: the entry function's name, first in the string table.
+    info[48..52].copy_from_slice(&1u32.to_le_bytes());
     info[0] = u8::from(p.flag);
     if p.stage == 0 {
         // PSInfo.SampleFrequency: an input interpolated per sample, or the
@@ -219,19 +229,22 @@ pub(crate) fn psv(p: &Psv) -> Vec<u8> {
         info[12] = u8::from(p.flag);
         info[26..28].copy_from_slice(&(max_vertices as u16).to_le_bytes());
     }
-    out.extend(info);
+    out.extend(&info[..size]);
     u32s(&mut out, &[p.bindings.len() as u32]);
     if !p.bindings.is_empty() {
         u32s(&mut out, &[24]);
         for b in p.bindings {
             u32s(
                 &mut out,
-                &[b.kind, b.space, b.register, b.register, b.dxil_kind, 0],
+                &[b.kind, b.space, b.register, b.register + b.count - 1, b.dxil_kind, 0],
             );
         }
     }
     // Names of arbitrary semantics (system values use ""), then indices.
     let mut strings = vec![0u8];
+    if p.v3 {
+        strings.extend(b"main ");
+    }
     let mut indices: Vec<u32> = Vec::new();
     let mut elements = Vec::new();
     for e in p.inputs.iter().chain(p.outputs).chain(p.prims) {

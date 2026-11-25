@@ -131,6 +131,8 @@ fn lowered_on(
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
         root_uavs: lowered.root_uavs,
+        address_map: lowered.address_map,
+        descriptor_words: lowered.descriptor_words,
         root_indexed_views: res.root_indexed_views,
     })
 }
@@ -449,6 +451,20 @@ fn on_the_card(shader: &HostShader, constants: [u32; 2]) -> Option<u32> {
     Some(out[0][0])
 }
 
+/// The fewest lanes a wave of the device [`on_the_card`] runs on has, if there is one.
+fn wave_lanes() -> Option<u32> {
+    use windows::Win32::Graphics::Direct3D12::{D3D12_FEATURE_D3D12_OPTIONS1, D3D12_FEATURE_DATA_D3D12_OPTIONS1};
+    let host = Host::new(false).ok()?;
+    let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+    // SAFETY: a plain query that fills a structure of the given size.
+    unsafe {
+        host.device
+            .CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS1, (&raw mut options).cast(), size_of_val(&options) as u32)
+            .ok()?
+    };
+    Some(options.WaveLaneCountMin)
+}
+
 /// A 32-lane console wave. A register holds a lane mask on one path (the lanes below s0)
 /// and a number on the other, and is read as a number after the join, as the trace programs
 /// keep their lanes' masks and their node numbers on one stack
@@ -474,6 +490,13 @@ fn a_lane_mask_joined_with_a_number_is_read_as_the_number_it_is() {
         v.validate(&mut copy).expect("DXIL validation failed");
     }
     let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    // The program is a 32-lane wave's: a device whose waves are narrower
+    // (the software adapter's have 4 lanes) runs it as several waves, and
+    // a ballot of 32 lanes is no mask of one.
+    if let Some(lanes) = wave_lanes().filter(|&lanes| lanes < 32) {
+        eprintln!("the device's waves have {lanes} lanes, fewer than this program's 32; not run");
+        return;
+    }
     for (below, other, expected) in [(32u32, 0u32, u32::MAX), (10, 0, 0x3FF), (0, 0, 0), (10, 1, 5)] {
         let Some(got) = on_the_card(&shader, [below, other]) else { return };
         assert_eq!(got, expected, "{below} lanes in the mask, s1 = {other}");
@@ -529,4 +552,108 @@ fn scc_of_a_mask_operation_joined_with_a_scalar_test_needs_the_skip_wave_wide() 
         assert_eq!(got, expected, "{below} lanes inside, s1 = {s1}");
     }
     eprintln!("ran on the hardware device: the inner test's SCC for every lane once some lane is inside");
+}
+
+/// `WaveActiveSum` of a double as the console compiler expands it (the water passes): the
+/// threads below s1 take part, each with float(t) * s0 as a double; the sum's two dwords leave
+/// the whole-wave section through `s_mov_b32` and are taken as a float. One host wave of 64.
+#[test]
+fn a_wave_sum_of_doubles_is_the_host_waves_sum() {
+    let mut words = vec![
+        0x7E0C_0D00, // v_cvt_f32_u32 v6, v0
+        0x100C_0C00, // v_mul_f32 v6, s0, v6
+        0x7E26_2106, // v_cvt_f64_f32 v[19:20], v6
+        0x7D88_0001, // v_cmp_gt_u32 vcc, s1, v0
+        0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+        0xBE86_25C1, // s_or_saveexec_b64 s[6:7], -1
+        0x8790_0606, // s_and_b64 s[16:17], s[6:7], s[6:7]
+        0xD501_0002,
+        0x0042_2680, // v_cndmask_b32 v2, 0, v19, s[16:17]
+        0xD501_0003,
+        0x0042_2880, // v_cndmask_b32 v3, 0, v20, s[16:17]
+    ];
+    let add = [0xD564_0002, 0x0002_0504]; // v_add_f64 v[2:3], v[4:5], v[2:3]
+    for sel in [0xDE_54C1u32, 0x93_6012, 0x00_0924] {
+        // v_mov_b32 v4, v2 dpp8:[...]; v_mov_b32 v5, v3 dpp8:[...]
+        words.extend_from_slice(&[0x7E08_02E9, sel << 8 | 2, 0x7E0A_02E9, sel << 8 | 3]);
+        words.extend_from_slice(&add);
+    }
+    words.extend_from_slice(&[
+        0x7E08_02FA,
+        0xFF09_4002, // v_mov_b32 v4, v2 row_mirror bound_ctrl:1
+        0x7E0A_02FA,
+        0xFF09_4003, // v_mov_b32 v5, v3 row_mirror bound_ctrl:1
+    ]);
+    words.extend_from_slice(&add);
+    words.extend_from_slice(&[
+        0xD778_0004,
+        0x0201_0102, // v_permlanex16_b32 v4, v2, 0, 0
+        0xD778_0005,
+        0x0201_0103, // v_permlanex16_b32 v5, v3, 0, 0
+    ]);
+    words.extend_from_slice(&add);
+    words.extend_from_slice(&[
+        0xD760_0012,
+        0x0001_4102, // v_readlane_b32 s18, v2, 32
+        0xD760_0013,
+        0x0001_4103, // v_readlane_b32 s19, v3, 32
+        0xD564_0002,
+        0x0002_0412, // v_add_f64 v[2:3], s[18:19], v[2:3]
+        0xD760_0012,
+        0x0001_0102, // v_readlane_b32 s18, v2, 0
+        0xD760_0013,
+        0x0001_0103, // v_readlane_b32 s19, v3, 0
+        0xBE8E_0312, // s_mov_b32 s14, s18
+        0xBE8F_0313, // s_mov_b32 s15, s19
+        0xBEFE_0406, // s_mov_b64 exec, s[6:7]
+        0x7E00_1E0E, // v_cvt_f32_f64 v0, s[14:15]
+        0x38 << 26 | 0x1C << 18,
+        0x80 << 24 | 2 << 16, // buffer_store_dword v0, off, s[8:11], 0
+        0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+    ]);
+    let native = native(&words);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let count = |n: &str| p.blocks.iter().flat_map(|b| &b.insts).filter(|i| i.name() == n).count();
+    assert_eq!((count("v_add_f64"), count("v_permlanex16_b32"), count("v_cvt_f32_f64")), (6, 2, 1));
+    let shader = lowered_on(&native, &p, &HashSet::new(), 64).expect("lower");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; not run");
+        return;
+    };
+    let (root, pso) = match host.compute_pipeline(&shader) {
+        Ok(x) => x,
+        Err(e) => {
+            eprintln!("the hardware device does not take this program (waves of 64?): {e}; not run");
+            return;
+        }
+    };
+    for (k, n) in [(0.1f32, 64u32), (0.1, 37), (3.0e7, 64), (-0.75, 1)] {
+        let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        for u in &shader.user_data {
+            if let (RootType::Constants, 0) = (u.root, u.slot) {
+                ud[u.index as usize] = [k.to_bits(), n, 0, 0][u.dword as usize];
+            }
+        }
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &[View::RawUav(1)],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("dispatch failed: {e}"));
+        // (the lanes that do not take part add +0.0, so a lone -0.0 sums to +0.0)
+        let want = (0..n).fold(0.0f64, |s, t| s + f64::from(t as f32 * k)) as f32;
+        assert_eq!(out[0][0], want.to_bits(), "k {k}, {n} threads: got {}", f32::from_bits(out[0][0]));
+    }
+    eprintln!("ran on the hardware device: wave sums of doubles");
 }

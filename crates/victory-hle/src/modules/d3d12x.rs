@@ -30,21 +30,28 @@ extern "system" fn create_device(
 fn host_gpu_failed(what: &str) -> ! {
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, TerminateProcess};
     victory_loader::log_crash(&format!("VIctory: host GPU failure: {what}"));
+    // `VICTORY_FAILURE_WAIT=<seconds>`: stay alive that long first, so a
+    // driver-side crash dump (Nsight Aftermath) can be collected.
+    if let Some(s) = std::env::var("VICTORY_FAILURE_WAIT").ok().and_then(|v| v.parse::<u64>().ok()) {
+        std::thread::sleep(std::time::Duration::from_secs(s.min(600)));
+    }
     const DXGI_ERROR_DEVICE_REMOVED: u32 = 0x887A_0005;
     // SAFETY: ends our own process.
     unsafe { TerminateProcess(GetCurrentProcess(), DXGI_ERROR_DEVICE_REMOVED) };
     unreachable!("the process has ended")
 }
 
-/// The offline warm-up: see `victory_gpu::shader_cache::warm`.
-pub fn warm_shader(container: &[u8]) -> Result<bool, String> {
+/// The offline warm-up: see `victory_gpu::shader_cache::warm`. `lanes`:
+/// the host's wave sizes (min, max) as the run's log names them; `None`
+/// for any.
+pub fn warm_shader(container: &[u8], lanes: Option<(u32, u32)>) -> Result<bool, String> {
     #[cfg(windows)]
     {
-        victory_gpu::shader_cache::warm(container)
+        victory_gpu::shader_cache::warm(container, lanes)
     }
     #[cfg(not(windows))]
     {
-        let _ = container;
+        let _ = (container, lanes);
         Err("no shader cache on this host".into())
     }
 }

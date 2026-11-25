@@ -1285,3 +1285,80 @@ fn translated_compute_matches_pc() {
     let _ = std::fs::remove_dir_all(&dir);
     assert!(failures.is_empty(), "{failures:#?}");
 }
+
+/// Probe (not a check): which stride addresses a structured buffer when
+/// the shader's differs from the view's, and what bounds the read.
+#[test]
+fn structured_stride_probe() {
+    use super::host::{Dispatch, Stride, View};
+    let pc = match std::env::var_os("VICTORY_PC_DXC") {
+        Some(p) => PathBuf::from(p),
+        None => super::validator::Validator::default_path()
+            .unwrap()
+            .with_file_name("dxc.exe"),
+    };
+    let warp = std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1");
+    let host = Host::new(warp).unwrap();
+    let dir = std::env::temp_dir().join(format!("victory-probe-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let src = r#"
+#define RS "DescriptorTable(SRV(t0, numDescriptors=2)), DescriptorTable(UAV(u0, numDescriptors=1))"
+struct S1 { uint a; };
+struct S8 { uint a; uint b; uint c; uint d; uint e; uint f; uint g; uint h; };
+StructuredBuffer<S1> small : register(t0);
+StructuredBuffer<S8> big : register(t1);
+RWByteAddressBuffer outb : register(u0);
+[RootSignature(RS)] [numthreads(1, 1, 1)]
+void cs() {
+    outb.Store(0, small[5].a);
+    outb.Store(4, small[20].a);
+    outb.Store(8, small[31].a);
+    outb.Store(12, small[40].a);
+    outb.Store(16, big[3].h);
+    outb.Store(20, big[4].a);
+    outb.Store(24, big[30].a);
+    uint n, s;
+    small.GetDimensions(n, s);
+    outb.Store(28, n);
+    outb.Store(32, s);
+}
+"#;
+    let input = dir.join("p.hlsl");
+    let output = dir.join("p.bin");
+    std::fs::write(&input, src).unwrap();
+    let out = std::process::Command::new(&pc)
+        .args(["-T", "cs_6_5", "-E", "cs", "-Fo"])
+        .arg(&output)
+        .arg(&input)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let cs = std::fs::read(output).unwrap();
+    let data: Vec<u32> = (0..32u32).map(|i| 1000 + i).collect();
+    // Both views have 16-byte elements (8 of them).
+    let views = [
+        View::Buffer { data: &data, stride: Stride::Structured(4) },
+        View::Buffer { data: &data, stride: Stride::Structured(4) },
+        View::RawUav(16),
+    ];
+    // SAFETY: the PC container carries its root signature.
+    let root: ID3D12RootSignature = unsafe { host.device.CreateRootSignature(0, &cs) }.unwrap();
+    let pso = host.compute_pipeline_with(&root, &cs).unwrap();
+    let got = host
+        .dispatch(
+            &root,
+            &pso,
+            &Dispatch {
+                roots: vec![
+                    (0, Root::Table { sampler: false, index: 0 }),
+                    (1, Root::Table { sampler: false, index: 2 }),
+                ],
+                views: &views,
+                samplers: &[],
+                groups: [1, 1, 1],
+            },
+        )
+        .unwrap();
+    eprintln!("PROBE warp={warp} {:?}", &got[0][..9]);
+    let _ = std::fs::remove_dir_all(&dir);
+}

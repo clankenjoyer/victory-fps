@@ -8,7 +8,9 @@
 use std::ffi::{CStr, CString};
 use std::sync::Arc;
 
-use victory_shader::emit::{ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE};
+use victory_shader::emit::{
+    ADDRESS_MAP_SPACE, DESCRIPTOR_WORDS_SPACE, ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE,
+};
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -89,6 +91,69 @@ impl Default for GraphicsState {
             },
         }
     }
+}
+
+/// Whether the host blends into render targets of `format`. It never does into integer
+/// formats (`R8_UINT`...), where the console's hardware leaves blending out.
+fn blendable(format: DXGI_FORMAT) -> bool {
+    static KNOWN: std::sync::Mutex<Vec<(i32, bool)>> = std::sync::Mutex::new(Vec::new());
+    if format == DXGI_FORMAT_UNKNOWN {
+        return true;
+    }
+    let mut known = KNOWN.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(&(_, b)) = known.iter().find(|k| k.0 == format.0) {
+        return b;
+    }
+    let Some(host) = host() else { return true };
+    let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT { Format: format, ..Default::default() };
+    // SAFETY: a plain query into our own structure.
+    let asked = unsafe {
+        host.device.CheckFeatureSupport(
+            D3D12_FEATURE_FORMAT_SUPPORT,
+            (&raw mut support).cast(),
+            size_of_val(&support) as u32,
+        )
+    };
+    let b = asked.is_err() || support.Support1.0 & D3D12_FORMAT_SUPPORT1_BLENDABLE.0 != 0;
+    if !b {
+        tracing::info!(format = format.0, "the host does not blend into this format: blending off for such targets");
+    }
+    known.push((format.0, b));
+    b
+}
+
+/// The blend state the host takes for `g`: the title's, with blending off for the
+/// render targets whose format the host does not blend into. The console's hardware
+/// ignores blending there, and the host refuses the pipeline (E_INVALIDARG: the
+/// windshield wiper mask blends MAX into an `R8_UINT` target).
+pub(crate) fn host_blend(g: &GraphicsState) -> D3D12_BLEND_DESC {
+    blend_where(g, blendable)
+}
+
+/// [`host_blend`] with `blendable` telling which formats the host blends into.
+fn blend_where(g: &GraphicsState, blendable: impl Fn(DXGI_FORMAT) -> bool) -> D3D12_BLEND_DESC {
+    let mut b = g.blend;
+    let n = (g.targets.NumRenderTargets as usize).min(8);
+    let rt = |b: &D3D12_BLEND_DESC, i: usize| {
+        if b.IndependentBlendEnable.as_bool() { b.RenderTarget[i] } else { b.RenderTarget[0] }
+    };
+    let off: Vec<usize> = (0..n)
+        .filter(|&i| rt(&b, i).BlendEnable.as_bool() && !blendable(g.targets.RTFormats[i]))
+        .collect();
+    // (A logic operation keeps the shared description: it needs one.)
+    if off.is_empty() || (0..n).any(|i| rt(&b, i).LogicOpEnable.as_bool()) {
+        return b;
+    }
+    if !b.IndependentBlendEnable.as_bool() {
+        b.IndependentBlendEnable = true.into();
+        for i in 1..8 {
+            b.RenderTarget[i] = b.RenderTarget[0];
+        }
+    }
+    for i in off {
+        b.RenderTarget[i].BlendEnable = false.into();
+    }
+    b
 }
 
 impl GraphicsState {
@@ -290,12 +355,20 @@ pub(crate) struct Stage {
     /// Root UAVs: one-view tables like the SRVs (or root descriptors with
     /// `VICTORY_ROOT_SRV_DIRECT=1`).
     pub(crate) root_uavs: Vec<(u8, u32)>,
+    /// The root parameters of the address map and of the descriptor words,
+    /// when it reads them.
+    pub(crate) address_map: Option<u32>,
+    pub(crate) descriptor_words: Option<u32>,
+    /// The translation it was made from when that is of a hot reload
+    /// generation after the first (diagnostics): a later reload does not
+    /// change it under this pipeline.
+    pub(crate) pinned: Option<&'static Translated>,
 }
 
 impl Stage {
     pub(crate) fn translated(&self) -> &Translated {
-        self.shader
-            .translated()
+        self.pinned
+            .or_else(|| self.shader.translated_in(0))
             .expect("host pipelines are made from translated shaders")
     }
 }
@@ -338,7 +411,9 @@ fn refuse(reason: &'static str, shaders: &[Arc<Shader>]) -> Option<HostPipeline>
 impl HostPipeline {
     /// A host pipeline for vertex and pixel shaders with the graphics
     /// state `g`, or for one compute shader.
-    pub(crate) fn new(shaders: &[Arc<Shader>], g: Option<&GraphicsState>) -> Option<HostPipeline> {
+    /// `generation`: the hot reload generation whose translations it is
+    /// made from (0 without hot reload).
+    pub(crate) fn new(shaders: &[Arc<Shader>], g: Option<&GraphicsState>, generation: u64) -> Option<HostPipeline> {
         // For the report when the host device is removed: what this thread
         // has in the library from here on.
         super::library::label(format!("{shaders:?}"));
@@ -374,7 +449,7 @@ impl HostPipeline {
             return refuse("the host GPU has no mesh shaders (or no shader model 6.6)", shaders);
         }
         for (s, _) in &stages {
-            s.translated()?;
+            s.translated_in(generation)?;
         }
         let host = host()?;
 
@@ -386,13 +461,16 @@ impl HostPipeline {
         let mut samplers = Vec::new();
         let mut bound = Vec::new();
         for &(shader, visibility) in &stages {
-            let t = &shader.translated()?.host;
+            let t = &shader.translated_in(generation)?.host;
             let mut stage = Stage {
                 shader: shader.clone(),
                 user_data: None,
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
                 root_uavs: Vec::new(),
+                address_map: None,
+                descriptor_words: None,
+                pinned: shader.pinned(generation),
             };
             let dwords = t.user_data_dwords();
             if dwords > 0 {
@@ -430,12 +508,15 @@ impl HostPipeline {
                     let uav = kind == D3D12_ROOT_PARAMETER_TYPE_UAV;
                     // Ours, not the title's, stay root descriptors: the
                     // table of strides, the directory of title memory by
-                    // address and its fault notes.
+                    // address and its fault notes, the write marks' table
+                    // and bitmap.
                     let ours = if uav {
-                        slot == victory_shader::emit::SLOT_FAULTS
+                        slot == victory_shader::emit::SLOT_FAULTS || slot == victory_shader::emit::SLOT_VIEW_WRITES
                     } else {
                         slot == victory_shader::emit::SLOT_STRIDES
+                            || slot == victory_shader::emit::SLOT_REDIRECT
                             || slot == victory_shader::emit::SLOT_MEMORY
+                            || slot == victory_shader::emit::SLOT_VIEW_MARKS
                     };
                     if (uav || kind == D3D12_ROOT_PARAMETER_TYPE_SRV) && !ours && bounded_root_srvs() {
                         // A one-view table: the view's size bounds the
@@ -483,6 +564,31 @@ impl HostPipeline {
                     });
                 }
             }
+            // The address map and the descriptor words (upstream #1198), for
+            // a shader that reads them.
+            for (wanted, space, out) in [
+                (t.address_map, ADDRESS_MAP_SPACE, &mut stage.address_map),
+                (
+                    t.descriptor_words,
+                    DESCRIPTOR_WORDS_SPACE,
+                    &mut stage.descriptor_words,
+                ),
+            ] {
+                if wanted {
+                    *out = Some(params.len() as u32);
+                    params.push(D3D12_ROOT_PARAMETER1 {
+                        ParameterType: D3D12_ROOT_PARAMETER_TYPE_SRV,
+                        Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                            Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                                ShaderRegister: 0,
+                                RegisterSpace: space,
+                                Flags: D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE,
+                            },
+                        },
+                        ShaderVisibility: visibility,
+                    });
+                }
+            }
             for (n, s) in t.static_samplers.iter().enumerate() {
                 samplers.push(D3D12_STATIC_SAMPLER_DESC {
                     Filter: D3D12_FILTER(s.filter as i32),
@@ -510,7 +616,7 @@ impl HostPipeline {
             }
         };
         let code = |i: usize| {
-            stages.get(i).and_then(|(s, _)| s.translated()).map_or(
+            stages.get(i).and_then(|(s, _)| s.translated_in(generation)).map_or(
                 D3D12_SHADER_BYTECODE::default(),
                 |t| D3D12_SHADER_BYTECODE {
                     pShaderBytecode: t.host.dxil.as_ptr().cast(),
@@ -589,7 +695,9 @@ impl HostPipeline {
             let pso = match mesh_pipeline(&host.device, &root, code(0), code(1), g, depth_bounds, &name) {
                 Ok(pso) => pso,
                 Err(e) => {
-                    tracing::warn!(error = %e, ?shaders, "host mesh pipeline refused");
+                    // The state too: the shaders alone make a pipeline
+                    // with another state (`victory translate` pairs).
+                    tracing::warn!(error = %e, ?shaders, state = %state, "host mesh pipeline refused");
                     host.log_messages();
                     return None;
                 }
@@ -616,8 +724,8 @@ impl HostPipeline {
         // fall back on what `draw` does for rectangles.
         let mut rect_gs = None;
         if g.topology.0 == RECTANGLES {
-            let ps = stages.get(1).and_then(|(s, _)| s.translated());
-            let vs = &stages[0].0.translated()?.host.dxil;
+            let ps = stages.get(1).and_then(|(s, _)| s.translated_in(generation));
+            let vs = &stages[0].0.translated_in(generation)?.host.dxil;
             match victory_shader::emit::rect_list_gs(vs, ps.map(|t| &t.host.dxil[..])) {
                 Ok(gs) => rect_gs = Some(gs),
                 Err(e) => tracing::warn!(error = %e, ?shaders, "no rectangle geometry stage"),
@@ -634,7 +742,7 @@ impl HostPipeline {
                     BytecodeLength: gs.len(),
                 }
             }),
-            BlendState: g.blend,
+            BlendState: host_blend(g),
             SampleMask: g.sample_mask,
             RasterizerState: g.rasterizer,
             DepthStencilState: g.depth,
@@ -695,7 +803,7 @@ impl HostPipeline {
         let pso = match made {
             Ok(pso) => pso,
             Err(e) => {
-                tracing::warn!(error = %e, ?shaders, "host pipeline refused");
+                tracing::warn!(error = %e, ?shaders, state = %state, "host pipeline refused");
                 host.log_messages();
                 return None;
             }
@@ -881,7 +989,7 @@ fn mesh_pipeline(
             root: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, root.as_raw()),
             ms: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, ms),
             ps: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, ps),
-            blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, g.blend),
+            blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, host_blend(g)),
             mask: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, g.sample_mask),
             raster: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, g.rasterizer),
             depth,
@@ -900,7 +1008,7 @@ fn mesh_pipeline(
             root: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, root.as_raw()),
             ms: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, ms),
             ps: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, ps),
-            blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, g.blend),
+            blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, host_blend(g)),
             mask: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, g.sample_mask),
             raster: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, g.rasterizer),
             depth: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1, g.depth1()),
@@ -971,6 +1079,49 @@ fn root_signature(
         let bytes =
             std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize());
         Ok((device.CreateRootSignature(0, bytes)?, bytes.to_vec()))
+    }
+}
+
+#[cfg(test)]
+mod blend_tests {
+    use super::*;
+
+    fn state(independent: bool, formats: &[DXGI_FORMAT]) -> GraphicsState {
+        let mut g = GraphicsState::default();
+        g.blend.IndependentBlendEnable = independent.into();
+        let max = D3D12_RENDER_TARGET_BLEND_DESC {
+            BlendEnable: true.into(),
+            LogicOpEnable: false.into(),
+            SrcBlend: D3D12_BLEND_ONE,
+            DestBlend: D3D12_BLEND_ONE,
+            BlendOp: D3D12_BLEND_OP_MAX,
+            SrcBlendAlpha: D3D12_BLEND_ONE,
+            DestBlendAlpha: D3D12_BLEND_ZERO,
+            BlendOpAlpha: D3D12_BLEND_OP_ADD,
+            LogicOp: D3D12_LOGIC_OP_NOOP,
+            RenderTargetWriteMask: 15,
+        };
+        g.blend.RenderTarget = [max; 8];
+        g.targets.NumRenderTargets = formats.len() as u32;
+        g.targets.RTFormats[..formats.len()].copy_from_slice(formats);
+        g
+    }
+
+    /// The windshield wiper mask: MAX into R32_FLOAT, B4G4R4A4 and R8_UINT.
+    #[test]
+    fn integer_targets_take_no_blending() {
+        let not_uint = |f: DXGI_FORMAT| f != DXGI_FORMAT_R8_UINT;
+        let formats = [DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_B4G4R4A4_UNORM, DXGI_FORMAT_R8_UINT];
+        for independent in [true, false] {
+            let b = blend_where(&state(independent, &formats), not_uint);
+            let on: Vec<bool> = b.RenderTarget[..3].iter().map(|t| t.BlendEnable.as_bool()).collect();
+            assert_eq!(on, [true, true, false], "independent {independent}");
+            assert!(b.IndependentBlendEnable.as_bool());
+            assert_eq!(b.RenderTarget[1].BlendOp, D3D12_BLEND_OP_MAX, "the others keep their blending");
+        }
+        // Nothing to change: the title's state as it is.
+        let g = state(false, &[DXGI_FORMAT_R32_FLOAT]);
+        assert!(!blend_where(&g, not_uint).IndependentBlendEnable.as_bool());
     }
 }
 
@@ -1075,6 +1226,13 @@ mod tests {
         };
         if !host.depth_bounds() {
             eprintln!("no host depth bounds support; skipped");
+            return;
+        }
+        // The software adapter says it takes the test and draws through it
+        // all the same (depth 0.5 passes bounds of [0.6, 1.0]): the test is
+        // for a card.
+        if crate::host::on_warp() {
+            eprintln!("the software adapter does not apply depth bounds; skipped");
             return;
         }
         let Some(dxc) = dxc() else {

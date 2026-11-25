@@ -108,6 +108,7 @@ pub(crate) enum Cast {
     FpToSi = 4,
     UiToFp = 5,
     SiToFp = 6,
+    FpExt = 8,
     Bitcast = 11,
 }
 
@@ -284,6 +285,16 @@ impl Module {
     pub fn int_const(&mut self, ty: Ty, v: i64) -> V {
         self.constant(ty, Const::Int(v))
     }
+    /// The value of an integer constant (none for any other value).
+    pub fn int_value(&self, v: V) -> Option<i64> {
+        match v {
+            V::Const(i) => match self.consts[i as usize].1 {
+                Const::Int(n) => Some(n),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
     pub fn i32(&mut self, v: u32) -> V {
         let t = self.int(32);
         self.int_const(t, i64::from(v as i32))
@@ -313,17 +324,6 @@ impl Module {
             })
             .collect();
         self.constant(ty, Const::Aggregate(ids))
-    }
-
-    /// The value of an integer constant; `None` for anything else.
-    pub fn int_value(&self, v: V) -> Option<i64> {
-        match v {
-            V::Const(i) => match self.consts[i as usize].1 {
-                Const::Int(x) => Some(x),
-                _ => None,
-            },
-            _ => None,
-        }
     }
 
     /// Gives constant `old` the content of `new` (both stay valid).

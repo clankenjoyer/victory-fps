@@ -581,8 +581,35 @@ impl Layout {
         self.mips.get(mip as usize).map_or(0, |m| m.depth)
     }
 
+    /// The bytes from the texture's start that mip `first` and the smaller
+    /// ones take: the smaller a mip, the nearer the start it lies, so a
+    /// title that streams textures has memory for the smaller mips only and
+    /// another texture right behind them. All of the layout where slices
+    /// follow each other (each holds its whole chain).
+    pub fn bytes_from(&self, first: u32) -> u64 {
+        let whole = first == 0
+            || self.slices != 1
+            || self.thick
+            || self.desc.dimension == Dimension::Tex3d
+            || self.desc.samples != 1
+            || first >= self.desc.mips;
+        if whole {
+            return self.size;
+        }
+        self.mips[first as usize..]
+            .iter()
+            .map(|m| match m.tail {
+                Some(_) => self.alignment,
+                None => m.offset + u64::from(m.pitch) * u64::from(m.rows) * u64::from(self.desc.element_bytes),
+            })
+            .max()
+            .unwrap_or(self.size)
+            .min(self.size)
+    }
+
     /// Copies one subresource out of tiled memory (the whole texture,
-    /// [`Layout::size`] bytes) into linear rows: mip `mip` of array slice
+    /// [`Layout::size`] bytes, or the [`Layout::bytes_from`] of the mip)
+    /// into linear rows: mip `mip` of array slice
     /// `slice` (3D: every depth slice of the mip, `slice` 0). Rows are
     /// `row_pitch` bytes apart, depth slices `depth_pitch`.
     pub fn detile(
@@ -595,6 +622,49 @@ impl Layout {
         depth_pitch: usize,
     ) -> Result<(), Error> {
         self.walk::<true>(tiled, linear, mip, slice, row_pitch, depth_pitch)
+    }
+
+    /// Detiles a tiled 2D subresource in independent row bands. The caller
+    /// chooses a worker count appropriate for the size of the subresource.
+    /// Linear and volume textures use the ordinary path.
+    #[allow(clippy::too_many_arguments)]
+    pub fn detile_parallel(
+        &self,
+        tiled: &[u8],
+        mip: u32,
+        slice: u32,
+        linear: &mut [u8],
+        row_pitch: usize,
+        depth_pitch: usize,
+        workers: usize,
+    ) -> Result<(), Error> {
+        let (m, first, need) =
+            self.copy_bounds(tiled.len(), mip, slice, linear.len(), row_pitch, depth_pitch)?;
+        if workers < 2
+            || m.height < 2
+            || self.desc.dimension != Dimension::Tex2d
+            || self.desc.swizzle == Swizzle::LINEAR
+        {
+            return self.detile(tiled, mip, slice, linear, row_pitch, depth_pitch);
+        }
+
+        let rows_per_band = (m.height as usize).div_ceil(workers);
+        let mut bands = linear[..need].chunks_mut(rows_per_band * row_pitch).enumerate().peekable();
+        let copy_band = |band: usize, out: &mut [u8]| {
+            let start = (band * rows_per_band) as u32;
+            let end = m.height.min(start + rows_per_band as u32);
+            self.walk_rows::<true>(tiled, out, m, first, start..end, row_pitch, depth_pitch);
+        };
+        std::thread::scope(|scope| {
+            while let Some((band, out)) = bands.next() {
+                if bands.peek().is_some() {
+                    scope.spawn(move || copy_band(band, out));
+                } else {
+                    copy_band(band, out);
+                }
+            }
+        });
+        Ok(())
     }
 
     /// The reverse of [`Layout::detile`]: linear rows into tiled memory.
@@ -621,6 +691,26 @@ impl Layout {
         row_pitch: usize,
         depth_pitch: usize,
     ) -> Result<(), Error> {
+        let (tiled_len, linear_len) = if DETILE {
+            (src.len(), dst.len())
+        } else {
+            (dst.len(), src.len())
+        };
+        let (m, first, _) =
+            self.copy_bounds(tiled_len, mip, slice, linear_len, row_pitch, depth_pitch)?;
+        self.walk_rows::<DETILE>(src, dst, m, first, 0..m.height, row_pitch, depth_pitch);
+        Ok(())
+    }
+
+    fn copy_bounds(
+        &self,
+        tiled_len: usize,
+        mip: u32,
+        slice: u32,
+        linear_len: usize,
+        row_pitch: usize,
+        depth_pitch: usize,
+    ) -> Result<(&Mip, u32, usize), Error> {
         let m = self.mips.get(mip as usize).ok_or(Error::Invalid)?;
         let depth = m.depth;
         let first = if self.desc.dimension == Dimension::Tex3d {
@@ -645,14 +735,27 @@ impl Layout {
             .and_then(|(depth_offset, row_offset)| depth_offset.checked_add(row_offset))
             .and_then(|offset| offset.checked_add(bytes))
             .ok_or(Error::TooSmall)?;
-        let (tiled_len, linear_len) = if DETILE {
-            (src.len(), dst.len())
-        } else {
-            (dst.len(), src.len())
-        };
-        if tiled_len < self.size as usize || linear_len < need || row_pitch < bytes {
+        if tiled_len < self.bytes_from(mip) as usize || linear_len < need || row_pitch < bytes {
             return Err(Error::TooSmall);
         }
+        Ok((m, first, need))
+    }
+
+    /// Copies rows `rows` of mip `m` (all its depth slices) in one direction:
+    /// row `rows.start` lands at linear offset 0.
+    #[allow(clippy::too_many_arguments)]
+    fn walk_rows<const DETILE: bool>(
+        &self,
+        src: &[u8],
+        dst: &mut [u8],
+        m: &Mip,
+        first: u32,
+        rows: std::ops::Range<u32>,
+        row_pitch: usize,
+        depth_pitch: usize,
+    ) {
+        let n = self.desc.element_bytes as usize;
+        let bytes = m.width as usize * n;
         let linear = self.desc.swizzle == Swizzle::LINEAR;
         // The row and depth contribute one common base to every column, so
         // the same contiguous runs repeat on every row, including mip tails.
@@ -678,11 +781,11 @@ impl Layout {
             body.iter()
                 .all(|&(offset, _, len)| len == size && offset.is_multiple_of(size))
         });
-        for z in 0..depth {
+        for z in 0..m.depth {
             let (s, inner) = self.split(first + z);
             let base = u64::from(s) * self.slice_size + m.offset;
-            for y in 0..m.height {
-                let linear_row = z as usize * depth_pitch + y as usize * row_pitch;
+            for y in rows.clone() {
+                let linear_row = z as usize * depth_pitch + (y - rows.start) as usize * row_pitch;
                 if linear {
                     let tiled_row = base + u64::from(y) * u64::from(m.pitch) * n as u64;
                     copy_run::<DETILE>(src, dst, tiled_row as usize, linear_row, bytes);
@@ -704,7 +807,6 @@ impl Layout {
                 }
             }
         }
-        Ok(())
     }
 }
 
@@ -1102,6 +1204,34 @@ mod tests {
         assert_eq!(l.mips[0].offset, 8192 + 16384);
     }
 
+    /// The smaller mips lie first: they are read from the memory that holds
+    /// them alone, as from the whole texture's.
+    #[test]
+    fn smaller_mips_need_only_the_start_of_the_texture() {
+        // 1024x1024 BC1 (8-byte elements) in 4 KiB blocks: the tail (from
+        // 64x64 on), then 128x128 in two blocks, 256x256 in eight.
+        let l = Layout::new(&Desc { block: 4, ..desc(1024, 1024, 9, 8, Swizzle::SW_4KB_S) }).unwrap();
+        assert_eq!(l.bytes_from(0), l.size);
+        let needs: Vec<u64> = (0..9).map(|mip| l.bytes_from(mip)).collect();
+        assert!(needs.windows(2).all(|w| w[0] >= w[1]), "{needs:?}");
+        assert_eq!((l.bytes_from(4), l.bytes_from(8)), (4096, 4096));
+        let tiled: Vec<u8> = (0..l.size).map(|i| (i * 7 >> 3) as u8).collect();
+        for mip in 1..9 {
+            let m = l.mips[mip as usize];
+            let pitch = m.width as usize * 8;
+            let read = |tiled: &[u8]| {
+                let mut linear = vec![0; pitch * m.height as usize];
+                l.detile(tiled, mip, 0, &mut linear, pitch, pitch * m.height as usize).map(|()| linear)
+            };
+            let len = l.bytes_from(mip) as usize;
+            assert_eq!(read(&tiled[..len]), read(&tiled));
+            assert_eq!(read(&tiled[..len - 1]), Err(Error::TooSmall));
+        }
+        // Slices each hold their chain: the whole texture.
+        let l = Layout::new(&Desc { depth: 2, block: 4, ..desc(1024, 1024, 9, 8, Swizzle::SW_4KB_S) }).unwrap();
+        assert_eq!(l.bytes_from(4), l.size);
+    }
+
     #[test]
     fn depth_stencil_is_two_planes() {
         let t = Texture::new(&TextureDesc {
@@ -1121,6 +1251,33 @@ mod tests {
         assert_eq!(t.planes[1].offset, t.planes[0].layout.size);
         assert_eq!(t.planes[1].layout.size, 2048 * 1280);
         assert!(!t.planes[0].layout.addressable());
+    }
+
+    #[test]
+    fn parallel_detile_preserves_odd_mips_and_the_last_unpadded_row() {
+        let layout = Layout::new(&Desc {
+            depth: 2,
+            block: 4,
+            ..desc(517, 315, 5, 16, Swizzle::SW_64KB_D)
+        })
+        .unwrap();
+        let tiled: Vec<_> = (0..layout.size).map(|i| ((i >> 6) ^ (i >> 13) ^ i) as u8).collect();
+        for (mip, m) in layout.mips.iter().enumerate() {
+            let row_bytes = m.width as usize * 16;
+            let pitch = row_bytes.next_multiple_of(256);
+            let need = (m.height as usize - 1) * pitch + row_bytes;
+            let mut serial = vec![0xcc; need];
+            let mut parallel = serial.clone();
+            layout.detile(&tiled, mip as u32, 1, &mut serial, pitch, 0).unwrap();
+            layout
+                .detile_parallel(&tiled, mip as u32, 1, &mut parallel, pitch, 0, 3)
+                .unwrap();
+            assert_eq!(parallel, serial);
+            assert_eq!(
+                layout.detile_parallel(&tiled, mip as u32, 1, &mut parallel[..need - 1], pitch, 0, 3),
+                Err(Error::TooSmall)
+            );
+        }
     }
 
     #[test]

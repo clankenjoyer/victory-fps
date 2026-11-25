@@ -14,6 +14,7 @@ pub fn run(
 ) -> Result<()> {
     use std::sync::Arc;
     use victory_hle::{HleResolver, HostPolicy};
+    fast_defaults();
     use victory_loader::{BindReport, UnimplementedPolicy, WithTitleDlls};
 
     // A title that relaunched itself: the old process must be gone first.
@@ -341,4 +342,35 @@ mod tests {
 #[cfg(not(windows))]
 pub fn run(_: &Path, _: Unimplemented, _: bool, _: bool, _: Console) -> Result<()> {
     anyhow::bail!("running titles requires Windows")
+}
+
+/// The switches measured fastest in the world (per-frame time from about
+/// 1,100 ms to about 400), set unless the environment sets them already:
+/// `VICTORY_FAST_DEFAULTS=0` leaves every switch at the layer's own
+/// default. Each is described where it is read.
+fn fast_defaults() {
+    if std::env::var_os("VICTORY_FAST_DEFAULTS").is_some_and(|v| v == "0") {
+        return;
+    }
+    const FAST: &[(&str, &str)] = &[
+        ("VICTORY_LATE_WAIT", "3"),
+        ("VICTORY_RELAY", "2"),
+        ("VICTORY_WIDE_BACK", "1"),
+        ("VICTORY_CARD_BUFFERS_MIN_MB", "1"),
+        ("VICTORY_CARD_BUFFERS_MB", "1024"),
+        ("VICTORY_TEXTURE_NO_WAIT", "1"),
+        ("VICTORY_INDIRECT_CPU", "1"),
+        ("VICTORY_INDIRECT_WINDOW", "1"),
+        ("VICTORY_REFRESH_STAMP", "1"),
+        ("VICTORY_FAULT_TRACK", "1"),
+        ("VICTORY_LAZY_BACK", "1"),
+        ("VICTORY_BACK_ON_DEMAND", "1"),
+    ];
+    for (name, value) in FAST {
+        if std::env::var_os(name).is_none() {
+            // SAFETY: at start-up, before any thread of ours or the
+            // title's reads the environment.
+            unsafe { std::env::set_var(name, value) };
+        }
+    }
 }

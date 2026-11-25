@@ -62,10 +62,97 @@ fn err(e: windows::core::Error) -> String {
     e.message().to_string()
 }
 
+/// Whether an adapter is hardware. A machine without a GPU (a CI runner)
+/// can list the Microsoft Basic Render Driver, which is WARP, as an
+/// ordinary adapter without the software flag: its ids, or its name, tell.
+fn hardware(d: &DXGI_ADAPTER_DESC1) -> bool {
+    let basic_render_driver = d.VendorId == 0x1414 && d.DeviceId == 0x8c
+        || description(&d.Description) == "Microsoft Basic Render Driver";
+    d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 == 0 && !basic_render_driver
+}
+
+/// The hardware adapters, in DXGI's order: each one's description.
+pub fn adapters() -> Result<Vec<String>, String> {
+    // SAFETY: plain DXGI calls.
+    unsafe {
+        let factory: IDXGIFactory1 = CreateDXGIFactory1().map_err(err)?;
+        let mut out = Vec::new();
+        let mut i = 0;
+        while let Ok(a) = factory.EnumAdapters1(i) {
+            let d = a.GetDesc1().map_err(err)?;
+            if hardware(&d) {
+                out.push(description(&d.Description));
+            }
+            i += 1;
+        }
+        Ok(out)
+    }
+}
+
+fn description(wide: &[u16]) -> String {
+    let n = wide.iter().position(|&c| c == 0).unwrap_or(wide.len());
+    String::from_utf16_lossy(&wide[..n])
+}
+
 impl Host {
-    /// The default adapter, or WARP with `warp` (or `VICTORY_WARP=1`).
+    /// The wave sizes the device runs ([`super::Target::ANY`] if it does
+    /// not say).
+    pub fn target(&self) -> super::Target {
+        let mut o = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+        // SAFETY: the query writes the structure of the given size.
+        let ok = unsafe {
+            self.device
+                .CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS1,
+                    (&raw mut o).cast(),
+                    size_of_val(&o) as u32,
+                )
+                .is_ok()
+        };
+        if ok && o.WaveOps.as_bool() && o.WaveLaneCountMin > 0 {
+            super::Target {
+                lanes_min: o.WaveLaneCountMin,
+                lanes_max: o.WaveLaneCountMax,
+            }
+        } else {
+            super::Target::ANY
+        }
+    }
+
+    /// The default adapter, or WARP with `warp` (or `VICTORY_WARP=1`), or
+    /// the first hardware adapter whose description holds
+    /// `VICTORY_ADAPTER` (ignoring case: `nvidia`, `radeon`...).
     pub fn new(warp: bool) -> Result<Self, String> {
         let warp = warp || std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1");
+        match std::env::var("VICTORY_ADAPTER") {
+            Ok(name) if !warp && !name.is_empty() => Self::on(&name),
+            _ => Self::create(warp, None),
+        }
+    }
+
+    /// The first hardware adapter whose description holds `name`,
+    /// ignoring case.
+    pub fn on(name: &str) -> Result<Self, String> {
+        let want = name.to_lowercase();
+        // SAFETY: plain DXGI calls.
+        let adapter = unsafe {
+            let factory: IDXGIFactory1 = CreateDXGIFactory1().map_err(err)?;
+            let mut i = 0;
+            loop {
+                let a = factory
+                    .EnumAdapters1(i)
+                    .map_err(|_| format!("no adapter named {name:?}"))?;
+                let d = a.GetDesc1().map_err(err)?;
+                if hardware(&d) && description(&d.Description).to_lowercase().contains(&want) {
+                    break a;
+                }
+                i += 1;
+            }
+        };
+        Self::create(false, Some(adapter.cast().map_err(err)?))
+    }
+
+    fn create(warp: bool, adapter: Option<IDXGIAdapter>) -> Result<Self, String> {
         // SAFETY: plain D3D12/DXGI calls with valid out pointers.
         unsafe {
             // `VICTORY_D3D12_DEBUG`: the debug layer, whose messages a
@@ -84,6 +171,8 @@ impl Host {
                     CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(err)?;
                 let adapter: IDXGIAdapter = factory.EnumWarpAdapter().map_err(err)?;
                 D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
+            } else if let Some(adapter) = &adapter {
+                D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
             } else {
                 D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
                 // A machine without a graphics card gives the software
@@ -184,6 +273,31 @@ impl Host {
                 },
                 ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
             });
+        }
+        // The address map, then the descriptor words, come last.
+        for (wanted, space) in [
+            (
+                stages.iter().any(|(s, _)| s.address_map),
+                super::ADDRESS_MAP_SPACE,
+            ),
+            (
+                stages.iter().any(|(s, _)| s.descriptor_words),
+                super::DESCRIPTOR_WORDS_SPACE,
+            ),
+        ] {
+            if wanted {
+                params.push(D3D12_ROOT_PARAMETER1 {
+                    ParameterType: D3D12_ROOT_PARAMETER_TYPE_SRV,
+                    Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                        Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                            ShaderRegister: 0,
+                            RegisterSpace: space,
+                            Flags: D3D12_ROOT_DESCRIPTOR_FLAG_NONE,
+                        },
+                    },
+                    ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+                });
+            }
         }
         let mut samplers = Vec::new();
         for &(s, vis) in stages {
@@ -599,6 +713,8 @@ fn stub(pixel: bool, outputs: Vec<SigElement>) -> HostShader {
         root_cbvs: Vec::new(),
         root_srvs: Vec::new(),
         root_uavs: Vec::new(),
+        address_map: false,
+        descriptor_words: false,
         root_indexed_views: Vec::new(),
     }
 }
@@ -996,6 +1112,8 @@ pub enum View<'a> {
     Cbv(&'a [u32]),
     /// A buffer SRV over these dwords.
     Buffer { data: &'a [u32], stride: Stride },
+    /// A raw buffer UAV holding these dwords (read back like `RawUav`).
+    RawData(&'a [u32]),
 }
 
 /// How [`View::Buffer`] is viewed.
@@ -1224,7 +1342,7 @@ impl Host {
                         );
                         keep.push(tex);
                     }
-                    View::RawUav(_) | View::HalfUav(_) => {
+                    View::RawUav(_) | View::HalfUav(_) | View::RawData(_) => {
                         // (dwords, format, elements, flags)
                         let (n, format, elements, flags) = match *v {
                             View::HalfUav(e) => (
@@ -1234,6 +1352,10 @@ impl Host {
                                 D3D12_BUFFER_UAV_FLAG_NONE,
                             ),
                             View::RawUav(n) => {
+                                (n, DXGI_FORMAT_R32_TYPELESS, n, D3D12_BUFFER_UAV_FLAG_RAW)
+                            }
+                            View::RawData(d) => {
+                                let n = d.len() as u32;
                                 (n, DXGI_FORMAT_R32_TYPELESS, n, D3D12_BUFFER_UAV_FLAG_RAW)
                             }
                             _ => unreachable!(),
@@ -1256,6 +1378,17 @@ impl Host {
                             },
                         };
                         dev.CreateUnorderedAccessView(&b, None, Some(&desc), at);
+                        if let View::RawData(d) = *v {
+                            // The copy promotes the buffer to a copy target.
+                            let up = upload(d)?;
+                            list.CopyBufferRegion(&b, 0, &up, 0, bytes);
+                            list.ResourceBarrier(&[transition(
+                                &b,
+                                D3D12_RESOURCE_STATE_COPY_DEST,
+                                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                            )]);
+                            keep.push(up);
+                        }
                         let rb = make(
                             D3D12_HEAP_TYPE_READBACK,
                             &buffer(bytes, D3D12_RESOURCE_FLAG_NONE),

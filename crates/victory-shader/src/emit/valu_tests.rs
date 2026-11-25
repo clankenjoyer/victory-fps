@@ -90,6 +90,44 @@ const fn vgpr(n: u8) -> u16 {
     256 + n as u16
 }
 
+/// The first group's number the host gives the programs that ask for it.
+const GROUP_BASE: u32 = 65_535;
+
+/// A compute program that reads its group's number in x alone adds the number of
+/// the first group: a dispatch of more groups than the host runs comes in
+/// parts.
+#[test]
+fn a_group_number_in_x_counts_from_the_host_s_first_group() {
+    let program = |y: bool| -> Vec<u32> {
+        // s12 and s13: the group's number in x and in y (s5 and s6, after
+        // the 5 user SGPRs).
+        let mut words = vec![s_mov_b32(12, 5)];
+        if y {
+            words.push(s_mov_b32(13, 6));
+        }
+        words.push(s_mov_b32(5, 0x80));
+        words.extend_from_slice(&s_load_dwordx4(8, 4));
+        words.push(vop1(0x001, 1, sgpr(if y { 13 } else { 12 }))); // v_mov_b32 v1
+        words.push(vop1(0x001, 0, sgpr(12))); // v_mov_b32 v0, s12
+        // With y: what is stored is the number in y.
+        if y {
+            words.push(vop1(0x001, 0, vgpr(1))); // v_mov_b32 v0, v1
+        }
+        words.extend_from_slice(&buffer_store_dword(0, 8, 0));
+        words.push(S_ENDPGM);
+
+        words
+    };
+    const X: u32 = 1 << 7;
+    const Y: u32 = 1 << 8;
+    for (enabled, y, expected) in [(X, false, GROUP_BASE), (X | Y, false, GROUP_BASE), (X | Y, true, 0)] {
+        let shader = lower_words(program(y), 1, 0, enabled);
+        let asks = shader.user_data.iter().any(|u| u.root == RootType::Other(super::USER_GROUP_BASE));
+        assert_eq!(asks, expected != 0);
+        run_cases(&shader, &[[1, 2, 3, 4]], |label, _, _, out| assert_eq!(out, expected, "{label}"));
+    }
+}
+
 /// Builds and lowers a 1-thread synthetic RDNA2 compute shader that receives
 /// 4 dwords of root constants in `s0..s3`, runs `body` (leaving its result in
 /// `v0`), and stores `v0` to dword 0 of the raw UAV at heap index 0.
@@ -112,7 +150,12 @@ fn build_cs(body: &[u32], threads: u32, lds_bytes: u32) -> HostShader {
     words.extend_from_slice(body);
     words.extend_from_slice(&buffer_store_dword(0, 8, 0));
     words.push(S_ENDPGM);
+    lower_words(words, threads, lds_bytes, 0)
+}
 
+/// Lowers a whole program of [`build_cs`]'s layout; `rsrc2`: more bits of
+/// that register.
+fn lower_words(words: Vec<u32>, threads: u32, lds_bytes: u32, rsrc2: u32) -> HostShader {
     let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
     let native = NativeProgram {
         stage: HwStage::Cs,
@@ -147,7 +190,7 @@ fn build_cs(body: &[u32], threads: u32, lds_bytes: u32) -> HostShader {
             slot: 1,
         }],
         io: StageIo::Cs(ComputeIo {
-            rsrc2: (5 << 1) | ((lds_bytes / 512) << 15), // 5 user SGPRs: s0..s4
+            rsrc2: rsrc2 | (5 << 1) | ((lds_bytes / 512) << 15), // 5 user SGPRs: s0..s4
             threads: [threads, 1, 1],
         }),
         code,
@@ -180,6 +223,8 @@ fn build_cs(body: &[u32], threads: u32, lds_bytes: u32) -> HostShader {
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
         root_uavs: lowered.root_uavs,
+        address_map: lowered.address_map,
+        descriptor_words: lowered.descriptor_words,
         root_indexed_views: res.root_indexed_views,
     };
 
@@ -232,6 +277,7 @@ fn run_cases_on(
                 ud[u.index as usize] = match (u.root, u.slot) {
                     (RootType::Constants, 0) => inputs[u.dword as usize],
                     (RootType::Table, 1) => 0,
+                    (RootType::Other(super::USER_GROUP_BASE), _) => GROUP_BASE,
                     other => panic!("unexpected user data {other:?}"),
                 };
             }
@@ -1369,6 +1415,86 @@ fn v_cmp_class_f16_matches_rdna2() {
     });
 }
 
+/// The low and high dwords of a double.
+fn halves(x: f64) -> [u32; 2] {
+    let b = x.to_bits();
+    [b as u32, (b >> 32) as u32]
+}
+
+/// A register pair is a double: sums and products in doubles, and the
+/// conversions to and from floats (the water passes sum a wave in doubles).
+#[test]
+fn f64_pairs_add_multiply_and_convert() {
+    // v_add_f64 v[5:6], v[1:2], v[3:4]; v_cvt_f32_f64 v0, v[5:6]
+    let add_to_float = [vop3(0x164, 5, vgpr(1), vgpr(3), 0).as_slice(), &[vop1(0x00F, 0, vgpr(5))]].concat();
+    // v_add_f64 v[5:6], v[1:2], v[3:4]; v_mov_b32 v0, v6 (the high dword)
+    let add_high = [vop3(0x164, 5, vgpr(1), vgpr(3), 0).as_slice(), &[vop1(0x001, 0, vgpr(6))]].concat();
+    // v_cvt_f64_f32 v[5:6], v1; v_mul_f64 v[5:6], v[5:6], v[5:6]; v_cvt_f32_f64 v0, v[5:6]
+    let square = [
+        &[vop1(0x010, 5, vgpr(1))][..],
+        &vop3(0x165, 5, vgpr(5), vgpr(5), 0),
+        &[vop1(0x00F, 0, vgpr(5))],
+    ]
+    .concat();
+    let pairs: [(f64, f64); 3] = [(100_000_001.0, -100_000_000.0), (0.1, 0.2), (-3.5e-10, 1.0e30)];
+    let cases: Vec<[u32; 4]> = pairs
+        .iter()
+        .map(|&(a, b)| {
+            let ([al, ah], [bl, bh]) = (halves(a), halves(b));
+            [al, ah, bl, bh]
+        })
+        .collect();
+    let double = |c: [u32; 4], k: usize| f64::from_bits(u64::from(c[k]) | u64::from(c[k + 1]) << 32);
+    // In floats, 100000001 - 100000000 is 0 or 8; in doubles it is 1.
+    assert_eq!((100_000_001.0f64 + -100_000_000.0f64) as f32, 1.0);
+    let shader = build_valu_cs(&add_to_float);
+    run_cases(&shader, &cases, |backend, i, c, got| {
+        let want = (double(c, 0) + double(c, 2)) as f32;
+        assert_eq!(got, want.to_bits(), "{backend} case {i}: {} + {}", double(c, 0), double(c, 2));
+    });
+    let shader = build_valu_cs(&add_high);
+    run_cases(&shader, &cases, |backend, i, c, got| {
+        let want = halves(double(c, 0) + double(c, 2))[1];
+        assert_eq!(got, want, "{backend} case {i}");
+    });
+    // (squares that are normal floats: the host flushes float denormals, as the
+    // console does in its default mode)
+    let floats = [3.0f32, 1.0e-15, -16_777_217.0, 0.1];
+    let cases: Vec<[u32; 4]> = floats.iter().map(|f| [f.to_bits(), 0, 0, 0]).collect();
+    let shader = build_valu_cs(&square);
+    run_cases(&shader, &cases, |backend, i, c, got| {
+        let x = f64::from(f32::from_bits(c[0]));
+        assert_eq!(got, ((x * x) as f32).to_bits(), "{backend} case {i}: {x}");
+    });
+}
+
+/// `v_permlanex16_b32`: each lane reads, in the other row of 16 of its 32,
+/// the lane its nibble of {src2, src1} names.
+#[test]
+fn permlanex16_reads_the_other_row() {
+    // v_permlanex16_b32 v5, v0, s0, s1; v_readlane_b32 s6, v5, s2; v_mov_b32 v0, s6
+    let body = [
+        0xD778_0005,
+        0x0004_0100,
+        0xD760_0006,
+        0x0000_0505,
+        vop1(0x001, 0, sgpr(6)),
+    ];
+    let shader = build_cs(&body, 32, 0);
+    let mut cases = Vec::new();
+    for (lo, hi) in [(0x7654_3210u32, 0xFEDC_BA98u32), (0, 0), (0x0F1E_2D3C, 0x4B5A_6978)] {
+        for lane in [0u32, 5, 15, 16, 22, 31] {
+            cases.push([lo, hi, lane, 0]);
+        }
+    }
+    run_cases_on(&shader, &cases, &[("hardware", false)], |backend, i, c, got| {
+        let (sel, lane) = (u64::from(c[0]) | u64::from(c[1]) << 32, c[2]);
+        let row = (lane & !31) | ((lane & 16) ^ 16);
+        let want = row | (sel >> (4 * (lane & 15)) & 15) as u32;
+        assert_eq!(got, want, "{backend} case {i}: lane {lane}");
+    });
+}
+
 #[test]
 fn v_cvt_f32_f64_matches_ieee754() {
     // v_cvt_f32_f64 v0, v[1:2] (VOP1 opcode 0x00f -> VOP3 opcode 0x18f).
@@ -1568,6 +1694,8 @@ fn whole_wave_f64_sum_and_cvt_f32_f64() {
         root_srvs: lowered.root_srvs,
         root_uavs: lowered.root_uavs,
         root_indexed_views: Vec::new(),
+        address_map: lowered.address_map,
+        descriptor_words: lowered.descriptor_words,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         let mut copy = shader.dxil.clone();

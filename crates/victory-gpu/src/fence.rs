@@ -54,6 +54,54 @@ pub(crate) extern "system" fn create(
     object::hand_out(FENCE, fence, iid, &FENCE_IIDS, out)
 }
 
+/// A measure (in the log every 256 events): how long the title's fence
+/// events stood between being asked for and being set. The title's render
+/// thread stands at an event of its own most of every frame (profile of run
+/// fork15: 134 ms of 240); this says whether those are fence events, that
+/// is, whether the frame is as long as the way from a submission to its
+/// fence (preparing, the card, the copy-back).
+mod waited {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    use std::time::Instant;
+    static ASKED: Mutex<Vec<(usize, Instant)>> = Mutex::new(Vec::new());
+    static N: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+    static SINCE: Mutex<Option<(Instant, u64)>> = Mutex::new(None);
+    pub(super) fn registered(event: usize, reached: bool) {
+        if reached {
+            N[1].fetch_add(1, Relaxed);
+            return;
+        }
+        ASKED.lock().unwrap_or_else(|e| e.into_inner()).push((event, Instant::now()));
+    }
+    pub(super) fn signalled(event: usize) {
+        let at = {
+            let mut asked = ASKED.lock().unwrap_or_else(|e| e.into_inner());
+            asked.iter().position(|a| a.0 == event).map(|i| asked.swap_remove(i).1)
+        };
+        let Some(at) = at else { return };
+        let us = at.elapsed().as_micros() as u64;
+        N[2].fetch_add(us, Relaxed);
+        N[3].fetch_max(us, Relaxed);
+        if (N[0].fetch_add(1, Relaxed) + 1).is_multiple_of(256) {
+            let frame = crate::frame::current();
+            let mut since = SINCE.lock().unwrap_or_else(|e| e.into_inner());
+            let (then, frame_then) = since.replace((Instant::now(), frame)).unwrap_or((Instant::now(), frame));
+            let frames = frame.saturating_sub(frame_then).max(1) as f64;
+            let [n, reached, us, most] = [0, 1, 2, 3].map(|i| N[i].swap(0, Relaxed));
+            tracing::info!(
+                "fence events of the title: {:.1} a frame waited for ({:.1} more were reached already), {:.1} ms from asked to set on average, {:.1} ms at most, {:.1} ms a frame summed; {:.1} ms a frame of wall time",
+                n as f64 / frames,
+                reached as f64 / frames,
+                us as f64 / n.max(1) as f64 / 1000.0,
+                most as f64 / 1000.0,
+                us as f64 / frames / 1000.0,
+                then.elapsed().as_secs_f64() * 1000.0 / frames
+            );
+        }
+    }
+}
+
 fn set_event(event: usize) {
     #[cfg(windows)]
     // SAFETY: the title passed an event handle.
@@ -83,6 +131,7 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
     let mut waiters = fence.waiters.lock().unwrap_or_else(|e| e.into_inner());
     if fence.value.load(Ordering::Acquire) >= value {
         if !event.is_null() {
+            waited::registered(event as usize, true);
             set_event(event as usize);
         }
         return S_OK;
@@ -107,6 +156,7 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
         return E_NOTIMPL;
     }
     waiters.push((value, event as usize));
+    waited::registered(event as usize, false);
     S_OK
 }
 /// Moves the fence to `value` and sets the events that waited for it.
@@ -117,6 +167,7 @@ pub(crate) fn set(this: This, value: u64) {
     waiters.retain(|&(wanted, event)| {
         let reached = wanted <= value;
         if reached {
+            waited::signalled(event);
             set_event(event);
         }
         !reached

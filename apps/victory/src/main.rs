@@ -5,6 +5,7 @@
 
 mod census;
 mod inspect;
+mod replay;
 mod run;
 mod shader;
 mod translate;
@@ -75,9 +76,15 @@ enum Command {
         /// else the newest Windows SDK's).
         #[arg(long)]
         validate: bool,
-        /// Also create a host D3D12 pipeline for each emitted shader.
+        /// Also create a host D3D12 pipeline for each emitted shader
+        /// (translated for this host's wave sizes unless --host-lanes says).
         #[arg(long)]
         pipelines: bool,
+        /// Translate for a host whose waves are MIN-MAX lanes (32-32 for
+        /// NVIDIA, 32-64 for AMD RDNA): shaders that need another wave size
+        /// are listed as failures. Default: any wave size.
+        #[arg(long, value_name = "MIN-MAX", value_parser = parse_lanes)]
+        host_lanes: Option<(u32, u32)>,
         /// Print one line per program and outcome.
         #[arg(long)]
         list: bool,
@@ -87,7 +94,7 @@ enum Command {
         /// Warm the run's shader cache: a file of shader hashes (the 16
         /// hex digits a run's log names a shader by, anywhere in a line);
         /// the containers with those hashes are translated into the
-        /// cache and nothing else is done. Set `VICTORY_HOST_WAVE` and
+        /// cache and nothing else is done. Set `--host-lanes`, `VICTORY_HOST_WAVE` and
         /// `VICTORY_VIEW_LIMIT` to what the run's log says of the host.
         #[arg(long)]
         warm: Option<PathBuf>,
@@ -114,6 +121,12 @@ enum Command {
     },
     /// Show the resolved configuration and check it.
     Config,
+    /// Run one compute dispatch captured with `VICTORY_CAPTURE` on a fresh
+    /// device and report whether the device survived.
+    Replay(replay::Args),
+    /// Replay every capture under a directory, each in a child process;
+    /// one line per capture and a summary (exit 0 only if all ran).
+    ReplayAll(replay::AllArgs),
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -159,6 +172,7 @@ fn main() -> Result<()> {
             pipelines,
             list,
             jobs,
+            host_lanes,
             warm,
         } => {
             // `VICTORY_VIEW_LIMIT=<null slot>`: translate as on a host whose view heap is capped
@@ -170,9 +184,9 @@ fn main() -> Result<()> {
                 victory_shader::emit::set_host_max_wave(n);
             }
             if let Some(file) = warm {
-                return translate::warm(paths, &file, jobs);
+                return translate::warm(paths, &file, jobs, host_lanes);
             }
-            translate::run(paths, validate, pipelines, list, jobs)
+            translate::run(paths, validate, pipelines, list, jobs, host_lanes)
         }
         Command::Run {
             exe,
@@ -181,9 +195,36 @@ fn main() -> Result<()> {
             execute,
             console,
             title_args: _,
-        } => run::run(&exe, unimplemented, strict, execute, console),
+        } => {
+            let result = run::run(&exe, unimplemented, strict, execute, console);
+            // The process's own end, as `main`'s Result maps it: Ok is 0,
+            // Err is 1. A title that ends the process itself logs its own
+            // line and never returns here.
+            let code = if result.is_ok() { 0 } else { 1 };
+            tracing::info!("runtime exit: code {code}");
+            result
+        }
         Command::Config => show_config(),
+        Command::Replay(args) => replay::run(args),
+        Command::ReplayAll(args) => replay::run_all(args),
     }
+}
+
+/// `MIN-MAX` lanes per wave, or one size `N`.
+fn parse_lanes(s: &str) -> Result<(u32, u32), String> {
+    let (a, b) = s.split_once('-').unwrap_or((s, s));
+    let n = |x: &str| {
+        x.trim()
+            .parse::<u32>()
+            .ok()
+            .filter(|n| n.is_power_of_two() && (4..=128).contains(n))
+            .ok_or_else(|| format!("{x:?} is not a wave size (4 to 128, a power of two)"))
+    };
+    let (a, b) = (n(a)?, n(b)?);
+    if a > b {
+        return Err(format!("{a} is more than {b}"));
+    }
+    Ok((a, b))
 }
 
 fn show_config() -> Result<()> {

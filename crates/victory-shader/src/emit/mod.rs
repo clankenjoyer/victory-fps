@@ -54,6 +54,25 @@
 //!   for 32-bit operations and R32G32_UINT for 64-bit operations. The latter
 //!   require SM 6.6 atomic support on typed and descriptor-heap resources.
 //!
+//! * **Write marks** (with [`view_marks`], `VICTORY_VIEW_MARKS`; ported
+//!   2026-11-25 from upstream's `emit::Options::view_marks`): every store
+//!   or atomic through an unordered buffer view of the heap (tables, the
+//!   heap itself; not root UAVs, not title memory by address) also sets
+//!   bits in the root UAV `u`[`SLOT_VIEW_WRITES`] in [`ROOT_CBV_SPACE`], a
+//!   bitmap of [`VIEW_WRITE_BITS`] bits, so the host compares and copies
+//!   back only what shaders wrote. The root SRV `t`[`SLOT_VIEW_MARKS`]
+//!   there holds two dwords per heap index: a base bit, and a phase
+//!   (0-65535) with a typed view's element bytes above it; a write of byte
+//!   `x` of the view (its offset in the view: an element times the stride
+//!   plus the offset) sets bit `base + ((phase + x) >> 16)`, for the
+//!   access's first and last byte, at most [`VIEW_WRITE_BITS`] − 1. Base
+//!   [`VIEW_MARK_NONE`]: nothing is marked. The host gives each copy of
+//!   title memory a run of bits, one per 64 KiB title page it touches, and
+//!   a view the bit of its first byte's page as base with that byte's
+//!   offset in its page as phase. A program in which some write through a
+//!   heap view would go unmarked is lowered again without marks: a shader
+//!   that binds the bitmap marks every such write.
+//!
 //! Entry points: [`translate`] (container bytes as the title passes them
 //! at pipeline creation → [`HostShader`]), [`emit`] (the same with the
 //! earlier stages already run). The root constants of each stage must
@@ -80,8 +99,11 @@
 //!   shaders and draws triangle lists with the title's own vertex counts.
 //!   It binds nothing.
 
+pub mod address_map;
 mod bitcode;
 mod container;
+#[cfg(all(test, windows))]
+mod bvh_tests;
 #[cfg(all(test, windows))]
 mod diff_tests;
 #[cfg(all(test, windows))]
@@ -113,10 +135,60 @@ pub use sampler::StaticSampler;
 pub use lower::set_host_max_wave;
 pub use rect::rect_list_gs;
 pub use shader::{
-    MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
-    SLOT_STRIDES_COUNT, USER_DATA_SPACE, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
-    set_view_heap_limit, view_heap_limit,
+    ADDRESS_MAP_SPACE, DESCRIPTOR_WORDS_SPACE,
+    MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_REDIRECT, SLOT_STRIDES,
+    SLOT_STRIDES_COUNT, SLOT_VIEW_MARKS, SLOT_VIEW_WRITES, USER_DATA_SPACE, USER_GROUP_BASE, USER_MEMORY_BASE,
+    USER_VIEW_ADDRESS, USER_VIEW_BIAS, RECORD_SLOT_MARK, VIEW_DYNAMIC_SLOTS, VIEW_MARK_NONE, VIEW_MARK_SLOTS, VIEW_WRITE_BITS, set_view_heap_limit,
+    view_heap_limit, view_positions,
 };
+
+/// Whether translations mark the pages they write through buffer views
+/// (module notes, "Write marks"), so that the host compares and copies
+/// back only those: `VICTORY_VIEW_MARKS` (`0` off, `1` on; unset: off, see
+/// [`VIEW_MARKS_DEFAULT`]).
+/// Read once; it changes the DXIL of every program that writes through a
+/// heap view, and is part of the shader cache key
+/// ([`translation_settings`]). Off: the translations are as before.
+/// Whether a view picked from the heap is found through the redirect table
+/// (`VICTORY_VIEW_REDIRECT=1`; off by default). The design is xcl's
+/// (xcl-dev/xcl, GPL-2.0-only, `crates/xcl/src/hle/d3d12x/console_heap.rs`
+/// and `gpu/desc.rs`: every view has one PC descriptor in a shared heap,
+/// and the record console code copies around names it), written here for
+/// this translator.
+///
+/// Without it a program indexes the host's view heap at the position of
+/// the title's record, so the host keeps a host descriptor at every
+/// position the title writes a record to: the title rebuilds its tables for
+/// every draw (109,000 records and 14,500 tables a frame in the world),
+/// and each became a host view made anew, about 100 ms a frame of the
+/// recording threads and 32 ms of the submit thread (profile of run
+/// fork19).
+///
+/// With it the record at that position is read first (the root SRV
+/// `t<SLOT_REDIRECT>` in `ROOT_CBV_SPACE` is the title's heap as bytes): a
+/// record that carries a host slot of its own names the slot to read, and
+/// every other record is read at its position, as before. The host makes
+/// such a view's descriptor once, and a record copied anywhere costs it
+/// nothing. Read once; it changes the DXIL of every program that reads a
+/// view from the heap, and is part of the shader cache key.
+pub fn view_redirect() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_VIEW_REDIRECT").is_ok_and(|v| v.trim() == "1"))
+}
+
+pub fn view_marks() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("VICTORY_VIEW_MARKS") {
+        Ok(v) if v.trim() == "0" => false,
+        Ok(v) if v.trim() == "1" => true,
+        _ => VIEW_MARKS_DEFAULT,
+    })
+}
+
+/// [`view_marks`] when `VICTORY_VIEW_MARKS` is not set: off until a run has
+/// shown the marked translations validate and the copy-backs they narrow
+/// lose nothing (ported 2026-11-25 without one).
+const VIEW_MARKS_DEFAULT: bool = false;
 
 /// The loop limit without an override: 2^20.
 pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
@@ -197,6 +269,15 @@ pub fn shader_opt() -> u32 {
 pub fn translation_fingerprint() -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(env!("VICTORY_SHADER_SOURCE_HASH").as_bytes());
+    out.extend(translation_settings());
+    out
+}
+
+/// [`translation_fingerprint`] without the translator's source: the
+/// switches, host facts and settings alone (for a key that stands for the
+/// source, `VICTORY_SHADER_CACHE_KEY`).
+pub fn translation_settings() -> Vec<u8> {
+    let mut out = Vec::new();
     out.push(u8::from(cfg!(feature = "diagnostics")));
     out.push(u8::from(cfg!(debug_assertions)));
     for name in env!("VICTORY_SHADER_SWITCHES").split(',').filter(|n| !n.is_empty()) {
@@ -209,9 +290,24 @@ pub fn translation_fingerprint() -> Vec<u8> {
     }
     out.extend_from_slice(&lower::host_max_wave().to_le_bytes());
     out.extend_from_slice(&shader::view_heap_limit().to_le_bytes());
+    // Only when on: the keys of translations made without it stay as they were.
+    if view_redirect() {
+        out.extend_from_slice(b"view-redirect-2");
+    }
     out.extend_from_slice(&loop_limit().to_le_bytes());
     out.push(group_sync());
     out.extend_from_slice(&shader_opt().to_le_bytes());
+    // The write marks as they are in force (whatever the switch's text):
+    // also in a key that `VICTORY_SHADER_CACHE_KEY` stands for the source
+    // of, which keeps only these settings.
+    out.extend_from_slice(b"view marks=");
+    out.push(u8::from(view_marks()));
+    // Set by the host, not by a switch: the safe-bounds guard of views.
+    if let Some(g) = view_heap_guard() {
+        for v in [g.limit, g.kinds_slot, g.null_base] {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+    }
     out
 }
 
@@ -265,7 +361,207 @@ pub struct HostShader {
     /// [`ROOT_CBV_SPACE`].
     pub root_uavs: Vec<u8>,
     /// Heap descriptors that can be selected from root state at bind time.
+    /// The shader reads title memory at addresses it computes (the
+    /// address-map forms): the host binds the address map as a root SRV,
+    /// `t0` in [`ADDRESS_MAP_SPACE`]. See [`address_map`] for its layout.
+    pub address_map: bool,
+    /// The shader reads descriptors as numbers (the address-map forms): the
+    /// host binds the console words of the view heap's descriptors, 32
+    /// bytes per slot, as a root SRV, `t0` in [`DESCRIPTOR_WORDS_SPACE`].
+    pub descriptor_words: bool,
     pub root_indexed_views: Vec<crate::resource::RootIndexedView>,
+}
+
+/// The wave sizes (lanes per wave) the host GPU runs, as D3D12 reports them
+/// (`D3D12_FEATURE_DATA_D3D12_OPTIONS1::WaveLaneCountMin` / `Max`). Kept
+/// for callers that name the host per translation; the forms for a host of
+/// 32-lane waves follow [`set_host_max_wave`], which the runtime sets once
+/// per device (see [`translate_for`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Target {
+    pub lanes_min: u32,
+    pub lanes_max: u32,
+}
+
+impl Target {
+    /// No limit known: every wave size is taken to run.
+    pub const ANY: Target = Target {
+        lanes_min: 4,
+        lanes_max: 128,
+    };
+
+    /// Whether the host runs waves of `lanes`.
+    pub fn runs(self, lanes: u32) -> bool {
+        (self.lanes_min..=self.lanes_max).contains(&lanes)
+    }
+
+    /// The range as bytes, for cache keys.
+    pub fn key(self) -> [u8; 8] {
+        let mut k = [0; 8];
+        k[..4].copy_from_slice(&self.lanes_min.to_le_bytes());
+        k[4..].copy_from_slice(&self.lanes_max.to_le_bytes());
+        k
+    }
+}
+
+impl Default for Target {
+    fn default() -> Self {
+        Target::ANY
+    }
+}
+
+/// [`translate`]. The host's wave sizes reach the translation through
+/// [`set_host_max_wave`] (process-wide, set by the runtime from the device),
+/// not through `target`, which is accepted for the callers that pass one.
+pub fn translate_for(container: &[u8], target: Target) -> Result<HostShader, ShaderError> {
+    let _ = target;
+    translate(container)
+}
+
+/// A diagnostic: what the module this thread emitted last declares and
+/// calls (thread-group size, wave size, `dx.op` operations), for reports of
+/// a module the validator refuses. Nothing of the console program is in it.
+pub fn last_module_summary() -> String {
+    shader::last_summary()
+}
+
+/// A view heap guard as the host lays it out: per slot, the kind class of
+/// the descriptor there ([`kind_class`]) in a raw buffer at `kinds_slot`,
+/// and null views of every kind from `null_base` on ([`null_offset`]).
+/// The host keeps it for its own checks; the translation does not read it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HeapGuard {
+    pub limit: u32,
+    pub kinds_slot: u32,
+    pub null_base: u32,
+}
+
+/// Slots the guard takes at the top of the view heap: the kinds table and
+/// one null view per [`null_offset`].
+pub const GUARD_SLOTS: u32 = 24;
+
+/// The guard's log (a raw UAV past `null_base`): a count, then 16-byte
+/// records `(index, wanted kind | uav << 12, the slot's class mask,
+/// GUARD_LOG_MARK)`.
+pub const GUARD_LOG_SLOT: u32 = 22;
+/// Records the guard log holds; later ones overwrite the last.
+pub const GUARD_LOG_RECORDS: u32 = 4096;
+pub const GUARD_LOG_MARK: u32 = 0x6A4D_0000;
+
+/// `VICTORY_GUARD_LOG=1` (diagnostics).
+pub fn guard_log() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cfg!(feature = "diagnostics")
+            && std::env::var("VICTORY_GUARD_LOG").is_ok_and(|v| v.trim() == "1")
+    })
+}
+
+static VIEW_HEAP_GUARD: std::sync::Mutex<Option<HeapGuard>> = std::sync::Mutex::new(None);
+
+/// Sets the host view heap's guard; the first one set stays.
+pub fn set_view_heap_guard(g: HeapGuard) {
+    let mut b = VIEW_HEAP_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+    if b.is_none() {
+        *b = Some(g);
+    }
+}
+
+/// `VICTORY_SHADER_SAFE=1`: the slower, more defensive forms where a
+/// caller has them. Off by default.
+pub fn shader_safe() -> bool {
+    static SAFE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SAFE.get_or_init(|| std::env::var("VICTORY_SHADER_SAFE").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// The guard [`set_view_heap_guard`] set, if any. `VICTORY_NO_HEAP_GUARD`
+/// (diagnostics) turns it off.
+pub fn view_heap_guard() -> Option<HeapGuard> {
+    if cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_NO_HEAP_GUARD").is_some() {
+        return None;
+    }
+    *VIEW_HEAP_GUARD.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// DXIL resource kinds (`ResourceProperties` word 0, bits 0..8; bit 12
+/// is unordered access).
+pub mod kind {
+    pub const TEXTURE1D: u32 = 1;
+    pub const TEXTURE2D: u32 = 2;
+    pub const TEXTURE2DMS: u32 = 3;
+    pub const TEXTURE3D: u32 = 4;
+    pub const TEXTURECUBE: u32 = 5;
+    pub const TEXTURE1D_ARRAY: u32 = 6;
+    pub const TEXTURE2D_ARRAY: u32 = 7;
+    pub const TEXTURE2DMS_ARRAY: u32 = 8;
+    pub const TEXTURECUBE_ARRAY: u32 = 9;
+    pub const TYPED_BUFFER: u32 = 10;
+    pub const RAW_BUFFER: u32 = 11;
+    pub const STRUCTURED_BUFFER: u32 = 12;
+    pub const CBUFFER: u32 = 13;
+}
+
+/// The class a handle of DXIL kind `kind` (unordered access if `uav`) asks
+/// for, 1 to 9; 0 for none (samplers): 1 constant buffer, 2/6/7
+/// typed/raw/structured buffer view, 3/8/9 their unordered views, 4
+/// texture view, 5 unordered texture view.
+pub fn kind_class(kind: u32, uav: bool) -> u32 {
+    match (kind, uav) {
+        (kind::CBUFFER, _) => 1,
+        (kind::TYPED_BUFFER, false) => 2,
+        (kind::RAW_BUFFER, false) => 6,
+        (kind::STRUCTURED_BUFFER, false) => 7,
+        (kind::TYPED_BUFFER, true) => 3,
+        (kind::RAW_BUFFER, true) => 8,
+        (kind::STRUCTURED_BUFFER, true) => 9,
+        (1..=9, false) => 4,
+        (1..=9, true) => 5,
+        _ => 0,
+    }
+}
+
+/// The null view of DXIL kind `kind` (unordered if `uav`): its slot past
+/// the guard's `null_base`, 1 to 21 (0 is the kinds table).
+pub fn null_offset(kind: u32, uav: bool) -> u32 {
+    if !uav {
+        return if (1..=13).contains(&kind) { kind } else { kind::TEXTURE2D };
+    }
+    match kind {
+        kind::TEXTURE1D => 14,
+        kind::TEXTURE3D => 16,
+        kind::TEXTURE1D_ARRAY => 17,
+        kind::TEXTURE2D_ARRAY => 18,
+        kind::TYPED_BUFFER => 19,
+        kind::RAW_BUFFER => 20,
+        kind::STRUCTURED_BUFFER => 21,
+        _ => 15, // 2D
+    }
+}
+
+/// `VICTORY_GLOBAL_FORMS=0`: programs the default forms refuse are not
+/// tried again with the address-map forms ([`global_forms`]).
+fn global_forms_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_GLOBAL_FORMS").is_none_or(|v| v != "0"))
+}
+
+/// A program the default forms refuse, once more with the address-map
+/// forms of upstream PR #1198: every address only known at run time
+/// tracked as title memory ([`resource::with_runtime_addresses`]) and read
+/// through the address map, the ray test over it, descriptors read as
+/// numbers from the descriptor words ([`HostShader::address_map`],
+/// [`HostShader::descriptor_words`]).
+fn global_forms(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+) -> Result<HostShader, ShaderError> {
+    let res = resource::with_runtime_addresses(|| {
+        resource::track(p, &native.layout, native.stage, Some(st))
+    })?;
+    lower::with_global_forms(|| emit_program(c, native, p, st, io, &res)).map(|(s, _)| s)
 }
 
 impl HostShader {
@@ -529,14 +825,23 @@ pub fn emit(
         return original;
     }
     let edges = threading::constant_edges(p, st);
-    if edges.is_empty() {
-        return original;
+    let retried = if edges.is_empty() {
+        original
+    } else {
+        let threaded = || -> Result<HostShader, ShaderError> {
+            let p = ir::thread_edges(p, &edges)?;
+            let st = structure::structure(&p)?;
+            let io = io::raise(&p, native)?;
+            let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
+            emit_program(c, native, &p, &st, &io, &res).map(|(shader, _)| shader)
+        };
+        threaded()
+    };
+    // Still refused: the address-map forms, where they lower it.
+    if !matches!(retried, Err(ShaderError::Unsupported { .. })) || !global_forms_on() {
+        return retried;
     }
-    let p = ir::thread_edges(p, &edges)?;
-    let st = structure::structure(&p)?;
-    let io = io::raise(&p, native)?;
-    let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
-    emit_program(c, native, &p, &st, &io, &res).map(|(shader, _)| shader)
+    global_forms(c, native, p, st, io).or(retried)
 }
 
 /// `p` (a console wave64 compute program on a host of 32-lane waves) with the per-lane
@@ -636,6 +941,18 @@ fn emit_program(
             _ => 0,
         };
     }
+    // DXC packs only elements of one interpolation mode into a row. Where
+    // the defaults above part a row (a float declared `nointerpolation`
+    // beside an integer or the front face), the row's elements take the
+    // modes the source's PSV0 declares (inputs for a pixel shader, else
+    // outputs).
+    let source_modes = c
+        .part(FourCC::PSV0)
+        .and_then(|p| psv_interp_modes(p.data))
+        .map(|(ins, outs)| if pixel { ins } else { outs })
+        .unwrap_or_default();
+    let interpolated = if pixel { &mut inputs } else { &mut outputs };
+    unify_row_modes(interpolated, &source_modes);
     // With a conservative depth output (SV_DepthLessEqual, GreaterEqual) DXIL
     // wants the position centroid (or per sample), as DXC declares it then.
     if pixel && outputs.iter().any(|e| matches!(e.kind, 18 | 19)) {
@@ -668,7 +985,7 @@ fn emit_program(
         }
         _ => 0,
     };
-    let l = lower::lower(&lower::Parts {
+    let parts = lower::Parts {
         native,
         p,
         st,
@@ -678,7 +995,19 @@ fn emit_program(
         outputs,
         prims,
         mesh_stride,
-    })?;
+    };
+    let mut l = lower::lower(&parts)?;
+    // A write through a heap view that some form left unmarked: the host
+    // would take the shader's marks for all it wrote. Lowered again
+    // without marks (as with the switch off), so the host compares what
+    // it declares.
+    if l.marks_incomplete {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            eprintln!("victory-shader: a program writes through a heap view without its write mark; lowered without marks (more such programs are not reported)");
+        });
+        l = lower::without_view_marks(|| lower::lower(&parts))?;
+    }
     let wave_size = l.wave_size;
     let shader = HostShader {
         stage: native.stage,
@@ -700,9 +1029,92 @@ fn emit_program(
         root_cbvs: l.root_cbvs,
         root_srvs: l.root_srvs,
         root_uavs: l.root_uavs,
+        address_map: l.address_map,
+        descriptor_words: l.descriptor_words,
         root_indexed_views: res.root_indexed_views.clone(),
     };
     Ok((shader, wave_size))
+}
+
+/// An element's interpolation mode as the source's `PSV0` declares it:
+/// (semantic name, "" for a system value; index; semantic kind; mode).
+type SourceMode = (String, u32, u8, u8);
+
+/// The interpolation modes of the source's `PSV0` signature elements, as
+/// (inputs, outputs); none when the part is too old or malformed.
+fn psv_interp_modes(psv: &[u8]) -> Option<(Vec<SourceMode>, Vec<SourceMode>)> {
+    use crate::dxbc::u32_at;
+    let u32 = |at: usize| u32_at(psv, at).ok().map(|v| v as usize);
+    let info = u32(0)?;
+    // PSVRuntimeInfo1 (36 bytes) on: the element counts at 28 and 29.
+    if info < 36 {
+        return None;
+    }
+    let (n_in, n_out) = (usize::from(*psv.get(4 + 28)?), usize::from(*psv.get(4 + 29)?));
+    let mut at = 4 + info;
+    let resources = u32(at)?;
+    at += 4;
+    if resources > 0 {
+        at += 4 + u32(at)? * resources;
+    }
+    let strings_len = u32(at)?;
+    let strings = psv.get(at + 4..at + 4 + strings_len)?;
+    at += 4 + strings_len;
+    let n_indices = u32(at)?;
+    let indices_at = at + 4;
+    at = indices_at + 4 * n_indices;
+    if n_in + n_out == 0 {
+        return Some((Vec::new(), Vec::new()));
+    }
+    let size = u32(at)?;
+    at += 4;
+    if size < 16 {
+        return None;
+    }
+    let mut all = Vec::with_capacity(n_in + n_out);
+    for k in 0..n_in + n_out {
+        let e = at + k * size;
+        let name_at = u32(e)?;
+        let name = strings.get(name_at..)?.split(|&b| b == 0).next()?;
+        let index = u32(indices_at + 4 * u32(e + 4)?)? as u32;
+        let el = psv.get(e + 8..e + 16)?;
+        all.push((String::from_utf8_lossy(name).into_owned(), index, el[3], el[5]));
+    }
+    let outs = all.split_off(n_in);
+    Some((all, outs))
+}
+
+/// Gives every signature row whose elements' modes differ the modes
+/// `source` declares for them (DXIL wants one mode per row); a row the
+/// source leaves unresolved takes the constant mode an integer element in
+/// it holds.
+fn unify_row_modes(elements: &mut [container::SigElement], source: &[SourceMode]) {
+    let rows: std::collections::BTreeSet<u32> = elements.iter().filter_map(|e| e.row).collect();
+    for row in rows {
+        let of_row = |e: &container::SigElement| e.row == Some(row);
+        let mut modes = elements.iter().filter(|e| of_row(e)).map(|e| e.interp);
+        let first = modes.next();
+        if modes.all(|m| Some(m) == first) {
+            continue;
+        }
+        for e in elements.iter_mut().filter(|e| of_row(e)) {
+            let declared = source.iter().find(|(name, index, kind, _)| {
+                *index == e.index
+                    && u32::from(*kind) == u32::from(e.kind)
+                    && (e.kind != 0 || name.eq_ignore_ascii_case(&e.name))
+            });
+            if let Some(&(_, _, _, mode)) = declared {
+                e.interp = mode;
+            }
+        }
+        let mut modes = elements.iter().filter(|e| of_row(e)).map(|e| e.interp);
+        let first = modes.next();
+        if !modes.all(|m| Some(m) == first) && elements.iter().any(|e| of_row(e) && e.interp == 1) {
+            for e in elements.iter_mut().filter(|e| of_row(e)) {
+                e.interp = 1;
+            }
+        }
+    }
 }
 
 /// The rows of an `ISG1`/`OSG1` part.
@@ -1075,6 +1487,8 @@ mod tests {
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
+            address_map: false,
+            descriptor_words: false,
             root_indexed_views: Vec::new(),
         };
         let file = |var: &str, stage| {
@@ -1087,6 +1501,8 @@ mod tests {
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
                 root_uavs: Vec::new(),
+                address_map: false,
+                descriptor_words: false,
                 root_indexed_views: Vec::new(),
             })
         };
@@ -1126,6 +1542,184 @@ mod tests {
         let ours = c[4..20].to_vec();
         v.validate(&mut c).unwrap();
         assert_eq!(c[4..20], ours[..], "our hash differs from the validator's");
+    }
+
+    /// Triangle (0, 1, 2), each corner's 9-bit index in its 10-bit field.
+    const TRIANGLE: u32 = 1 << 10 | 2 << 20;
+    /// The edge flags of the three corners (bits 9, 19 and 29).
+    const EDGE_FLAGS: u32 = 1 << 9 | 1 << 19 | 1 << 29;
+    /// The culling bit.
+    const CULL: u32 = 1 << 31;
+
+    /// A one-wave (32-lane) triangle mesh program whose lanes all export
+    /// primitive `prim` and, as vertex `lane`, the position
+    /// (lane & 1 ? 3 : -1, lane & 2 ? 3 : -1, 0.5, 1): triangle (0, 1, 2)
+    /// covers the whole target.
+    fn triangle_mesh(prim: u32) -> Result<HostShader, ShaderError> {
+        let words = [
+            0xD765_0001u32, // v_mbcnt_lo_u32_b32 v1, -1, 0
+            0x0001_00C1,
+            0x3604_0281, // v_and_b32 v2, 1, v1
+            0x3606_0282, // v_and_b32 v3, 2, v1
+            0x7E04_0D02, // v_cvt_f32_u32 v2, v2
+            0x7E06_0D03, // v_cvt_f32_u32 v3, v3
+            0x1008_04F6, // v_mul_f32 v4, 4.0, v2
+            0x0608_08F3, // v_add_f32 v4, -1.0, v4
+            0x100A_06F4, // v_mul_f32 v5, 2.0, v3
+            0x060A_0AF3, // v_add_f32 v5, -1.0, v5
+            0x7E0C_02F0, // v_mov_b32 v6, 0.5
+            0x7E0E_02F2, // v_mov_b32 v7, 1.0
+            0x7E12_02FF, // v_mov_b32 v9, prim
+            prim,
+            0xF800_0941, // exp prim v9, off, off, off done
+            0x0000_0009,
+            0xF800_08CF, // exp pos0 v4, v5, v6, v7 done
+            0x0706_0504,
+            0xBF81_0000, // s_endpgm
+        ];
+        let native = NativeProgram {
+            stage: HwStage::Ms,
+            wave64: false,
+            vgprs: 10,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Ms(crate::native::MeshIo {
+                outputs: vec![],
+                clip_cntl: 0,
+                threads: 32,
+                max_vertices: 32,
+                max_primitives: 32,
+                topology: 2,
+                lds_bytes: 0,
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let position = SigElement {
+            name: "SV_Position".into(),
+            index: 0,
+            kind: 3,
+            comp: 9,
+            interp: 0,
+            row: Some(0),
+            col: 0,
+            cols: 4,
+            usage: 0xF,
+            half: false,
+        };
+        let osg1 = container::signature(&[position], false);
+        let bytes = crate::dxbc::build(&[(FourCC::OSG1, &osg1)]);
+        let c = Container::parse(&bytes)?;
+        let p = ir::build(&native.patched_code(), native.wave64, native.vgprs)?;
+        let st = structure::structure(&p)?;
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
+        let io = io::raise(&p, &native)?;
+        emit(&c, &native, &p, &st, &io, &res)
+    }
+
+    /// A primitive export's corners are 9-bit indices: the edge flag above
+    /// each (bits 9, 19, 29) is no part of it. Masking ten bits made a
+    /// flagged corner index 512 or more, past any mesh program's vertices
+    /// (the draw test below shows the triangle). Flagged, unflagged and
+    /// culled exports translate, and dxil.dll, where there is one, takes
+    /// each module.
+    #[test]
+    fn primitive_export_indices_drop_the_edge_flags() {
+        #[cfg(windows)]
+        let mut validator = super::validator::Validator::load(
+            super::validator::Validator::default_path().as_deref(),
+        )
+        .ok();
+        for prim in [
+            TRIANGLE,
+            TRIANGLE | EDGE_FLAGS,
+            TRIANGLE | EDGE_FLAGS | CULL,
+        ] {
+            let ms = triangle_mesh(prim).unwrap_or_else(|e| panic!("{prim:#x}: {e}"));
+            #[cfg(windows)]
+            if let Some(v) = validator.as_mut() {
+                v.validate(&mut ms.dxil.clone())
+                    .unwrap_or_else(|e| panic!("{prim:#x}: {e}"));
+            }
+        }
+    }
+
+    /// A triangle mesh program on the host GPU and on WARP (where they have
+    /// mesh shaders): triangle (0, 1, 2) covers the target with its corners'
+    /// edge flags set as without them; with the culling bit, nothing is lit.
+    #[test]
+    #[cfg(windows)]
+    fn edge_flagged_triangles_draw_as_unflagged_ones() {
+        use super::host::{Draw, Host, Root};
+        use windows::Win32::Graphics::Direct3D12::{
+            D3D12_FEATURE_D3D12_OPTIONS7, D3D12_FEATURE_DATA_D3D12_OPTIONS7,
+            D3D12_MESH_SHADER_TIER_NOT_SUPPORTED, D3D12_SHADER_VISIBILITY_MESH,
+        };
+        let _one = super::valu_tests::ONE_AT_A_TIME
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let ps = constant_color();
+        let mut ran = 0;
+        for (label, warp) in [("hardware", false), ("warp", true)] {
+            let Ok(host) = Host::new(warp) else {
+                eprintln!("no SM 6.6 {label} device; skipped");
+                continue;
+            };
+            let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS7::default();
+            // SAFETY: the query writes the structure of the given size.
+            let queried = unsafe {
+                host.device.CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS7,
+                    (&raw mut options).cast(),
+                    size_of_val(&options) as u32,
+                )
+            };
+            if queried.is_err() || options.MeshShaderTier == D3D12_MESH_SHADER_TIER_NOT_SUPPORTED {
+                eprintln!("no mesh shaders on the {label} device; skipped");
+                continue;
+            }
+            for (prim, culled) in [
+                (TRIANGLE, false),
+                (TRIANGLE | EDGE_FLAGS, false),
+                (TRIANGLE | EDGE_FLAGS | CULL, true),
+            ] {
+                let ms = triangle_mesh(prim).unwrap();
+                let root = host
+                    .root_signature_for(&[(&ms, D3D12_SHADER_VISIBILITY_MESH)])
+                    .unwrap();
+                let pso = host
+                    .mesh_pipeline_with(&root, &ms.dxil, &ps)
+                    .unwrap_or_else(|e| panic!("{label}: mesh pipeline: {e}"));
+                let texels = host
+                    .draw(
+                        &root,
+                        &pso,
+                        &Draw {
+                            roots: vec![(0, Root::Constants(vec![0]))],
+                            textures: &[],
+                            samplers: &[],
+                            vertices: &[],
+                            stride: 0,
+                            size: (16, 16),
+                            mesh_groups: 1,
+                        },
+                    )
+                    .unwrap_or_else(|e| panic!("{label}: draw: {e}"));
+                let lit = texels.iter().filter(|t| t[3] != 0.0).count();
+                if culled {
+                    assert_eq!(lit, 0, "{label}, {prim:#x}: a culled triangle lit texels");
+                    continue;
+                }
+                assert!(
+                    texels.iter().all(|t| *t == [1.0, 0.5, 0.25, 1.0]),
+                    "{label}, {prim:#x}: {lit} of 256 texels lit"
+                );
+            }
+            eprintln!("{label}: edge-flagged triangles drew");
+            ran += 1;
+        }
+        if ran == 0 {
+            eprintln!("no device with mesh shaders; skipped");
+        }
     }
 
     /// A pixel shader interpolating at sample positions (PERSP_SAMPLE
@@ -1376,6 +1970,8 @@ mod tests {
                 root_cbvs: l.root_cbvs,
                 root_srvs: l.root_srvs,
                 root_uavs: l.root_uavs,
+                address_map: false,
+                descriptor_words: false,
                 root_indexed_views: Vec::new(),
             };
             let (root, pso) = host.compute_pipeline(&cs).unwrap();

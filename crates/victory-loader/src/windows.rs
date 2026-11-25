@@ -83,6 +83,35 @@ pub fn load(prepared: &PreparedImage, dir: &Path) -> Result<LoadedImage> {
     if !loaded.info.is_dll() {
         // SAFETY: just mapped, and no title code has run.
         unsafe { crate::tls::redirect(loaded.base(), &loaded.info) }?;
+        // Debugging aid: `VICTORY_PATCH=<rva>:<hex bytes>,...` overwrites
+        // title code before it runs (to disable a watchdog under the slow
+        // GPU-based validation, say).
+        if let Ok(list) = std::env::var("VICTORY_PATCH") {
+            for entry in list.split(',').filter(|e| !e.trim().is_empty()) {
+                let parsed = entry.split_once(':').and_then(|(rva, hex)| {
+                    let rva = usize::from_str_radix(rva.trim().trim_start_matches("0x"), 16).ok()?;
+                    let hex = hex.trim();
+                    let bytes = (0..hex.len() / 2)
+                        .map(|i| u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).ok())
+                        .collect::<Option<Vec<u8>>>()?;
+                    (rva + bytes.len() <= loaded.info.size_of_image as usize).then_some((rva, bytes))
+                });
+                let Some((rva, bytes)) = parsed else {
+                    tracing::warn!(entry, "VICTORY_PATCH entry not understood");
+                    continue;
+                };
+                let at = loaded.base() + rva;
+                let mut old = 0;
+                // SAFETY: inside the mapped image; no title code has run.
+                unsafe {
+                    if VirtualProtect(at as _, bytes.len(), 0x40, &mut old) != 0 {
+                        std::ptr::copy_nonoverlapping(bytes.as_ptr(), at as *mut u8, bytes.len());
+                        VirtualProtect(at as _, bytes.len(), old, &mut old);
+                    }
+                }
+                tracing::warn!(rva = format_args!("{rva:#x}"), n = bytes.len(), "VICTORY_PATCH applied");
+            }
+        }
     }
     tracing::info!(
         base = format_args!("{:#x}", loaded.base()),

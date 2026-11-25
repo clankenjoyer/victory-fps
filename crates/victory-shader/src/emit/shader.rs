@@ -12,6 +12,14 @@ pub const SAMPLER_SPACE: u32 = 0;
 /// Where root CBVs and SRVs are bound: `b<root parameter index>` and
 /// `t<root parameter index>` in this space.
 pub const ROOT_CBV_SPACE: u32 = 1;
+/// Where the address map is bound: `t0` in this space (a root SRV), when
+/// the shader reads title memory at addresses it computes
+/// ([`crate::resource::GLOBAL`]; see [`super::HostShader::address_map`]).
+pub const ADDRESS_MAP_SPACE: u32 = 2;
+/// Where the descriptor words are bound: `t0` in this space (a root SRV),
+/// when the shader reads descriptors as numbers beyond what host views
+/// tell (see [`super::HostShader::descriptor_words`]).
+pub const DESCRIPTOR_WORDS_SPACE: u32 = 3;
 
 /// The root SRV `t<SLOT_STRIDES>` in [`ROOT_CBV_SPACE`] of a shader that
 /// reads buffers through descriptors it picks from the view heap at an
@@ -69,13 +77,66 @@ pub const USER_VIEW_ADDRESS: u32 = 0x101;
 /// view. Asked for every root UAV, and for the root SRVs of programs with
 /// a spilled user-data table.
 pub const USER_VIEW_BIAS: u32 = 0x103;
+/// `RootType::Other` code of a user-data dword the host sets: the number of
+/// the first thread group in x. The console dispatches any number of groups
+/// in one dimension; the host at most 65,535, so a larger dispatch runs in
+/// parts, each with the groups before it here. Asked for by compute programs
+/// that are told the x number alone (the one-dimensional ones).
+pub const USER_GROUP_BASE: u32 = 0x104;
+
+/// With [`super::view_redirect`]: the root SRV `t<SLOT_REDIRECT>` in
+/// [`ROOT_CBV_SPACE`] is the title's view heap as bytes (the host's copy of
+/// that memory), 32 bytes a record. The host writes, into every record it
+/// makes for a view that has a host slot of its own, that slot in dword 3
+/// and [`RECORD_SLOT_MARK`] in dword 4; the title copies records as bytes,
+/// and the two dwords go with them.
+pub const SLOT_REDIRECT: u8 = 250;
+/// Dword 4 of a record whose dword 3 is the host slot of its view.
+pub const RECORD_SLOT_MARK: u32 = u32::from_le_bytes(*b"vSLT");
+/// The dynamic slots that follow the title's in a host view heap (the
+/// host's `DYNAMIC`): a position at or past the title's slots is one of
+/// them, and is no record.
+pub const VIEW_DYNAMIC_SLOTS: u32 = 1 << 18;
+
+/// With [`super::view_redirect`]: how many positions of the title's view
+/// heap hold records a shader may look a slot up in (the host's slots for
+/// the title's own: the view heap limit less the dynamic slots; without a
+/// limit, as many as a table offset can name).
+pub fn view_positions() -> u32 {
+    match view_heap_limit() {
+        0 => 1 << 22,
+        limit => limit.saturating_sub(VIEW_DYNAMIC_SLOTS).max(1),
+    }
+}
+
+/// Write marks (`emit`, "Write marks"; with [`super::view_marks`]): the
+/// root SRV `t<SLOT_VIEW_MARKS>` in [`ROOT_CBV_SPACE`] is the bound view
+/// heap's view-mark table, two dwords per heap slot: the mark bit of the
+/// first byte of the unordered buffer view there ([`VIEW_MARK_NONE`]: its
+/// writes are not marked), and that byte's offset in its 64 KiB title page
+/// (bits 0-15) with, for a typed view, its element's bytes (bits 16-31).
+pub const SLOT_VIEW_MARKS: u8 = 252;
+/// The root UAV `u<SLOT_VIEW_WRITES>` in [`ROOT_CBV_SPACE`]: the written
+/// pages bitmap of buffer views, [`VIEW_WRITE_BITS`] bits.
+pub const SLOT_VIEW_WRITES: u8 = 251;
+/// A view-mark table entry's base for a slot whose writes are not marked.
+pub const VIEW_MARK_NONE: u32 = u32::MAX;
+/// Bits in the written-pages bitmap of buffer views; marks past it go to
+/// the last bit (which no copy owns).
+pub const VIEW_WRITE_BITS: u32 = 1 << 22;
+/// Heap indices read in the view-mark table are clamped below this when no
+/// view heap limit is set ([`set_view_heap_limit`]); with one, below it.
+pub const VIEW_MARK_SLOTS: u32 = 1 << 21;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
-    pub const RAW_BUFFERS: u64 = 1 << 4;
+    /// Double-precision floats (feature `Doubles`, 0x1).
     pub const DOUBLES: u64 = 1 << 2;
+    pub const RAW_BUFFERS: u64 = 1 << 4;
     pub const STENCIL_REF: u64 = 1 << 11;
     pub const TYPED_UAV_LOADS: u64 = 1 << 13;
+    pub const UAVS_64: u64 = 1 << 15;
+    pub const UAVS_AT_EVERY_STAGE: u64 = 1 << 16;
     pub const WAVE_OPS: u64 = 1 << 19;
     pub const BARYCENTRICS: u64 = 1 << 22;
     pub const INT64: u64 = 1 << 20;
@@ -148,12 +209,20 @@ pub(crate) struct Shader {
     pub samplers: u32,
     /// Bit n: immediate sampler n is a comparison sampler.
     pub cmp_samplers: u64,
+    /// Immediate samplers declared as one range (first, count): a
+    /// sampler the code chooses by control flow among constants, read
+    /// through one binding at a computed index ([`Shader::sampler_range_handle`]).
+    pub sampler_ranges: Vec<(u32, u32)>,
     /// Root CBVs read, by root parameter index, with their handles.
     pub root_cbvs: Vec<(u8, V)>,
     /// Root SRVs (raw buffers) read, likewise.
     pub root_srvs: Vec<(u8, V)>,
     /// Root UAVs (raw buffers) read or written, likewise.
     pub root_uavs: Vec<(u8, V)>,
+    /// The address map's handle, once made ([`Shader::address_map_handle`]).
+    pub address_map: Option<V>,
+    /// The descriptor words' handle, once made.
+    pub descriptor_words: Option<V>,
     pub flags: u64,
     /// Heap handles made with a non-uniform index.
     pub nonuniform_handles: u32,
@@ -166,6 +235,29 @@ pub(crate) struct Shader {
     lds: Option<V>,
     main: V,
     pub entry: usize,
+    /// The `dx.op` operations called (names without overload).
+    ops: std::collections::BTreeSet<String>,
+    /// The heap index (as clamped) of each handle of an unordered buffer
+    /// view made from the heap: writes through it are marked by that
+    /// index's view-mark entry (`emit`, "Write marks").
+    pub view_index: std::collections::HashMap<V, V>,
+    /// Stores and atomics emitted through those handles: each must have
+    /// its mark (`lower`'s count of marked ones must come out the same).
+    pub view_write_ops: u32,
+}
+
+thread_local! {
+    /// See [`last_summary`].
+    static LAST: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+}
+
+/// What the module this thread finished last declares and calls: its
+/// thread-group size and wave size, and its `dx.op` operations. A
+/// diagnostic for tools that report a module the validator refuses, since
+/// the validator's message for an operation the stage or the entry's
+/// properties do not allow names neither.
+pub(crate) fn last_summary() -> String {
+    LAST.with(|l| l.borrow().clone())
 }
 
 impl Shader {
@@ -208,9 +300,12 @@ impl Shader {
             user_data: 0,
             samplers: 0,
             cmp_samplers: 0,
+            sampler_ranges: Vec::new(),
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
+            address_map: None,
+            descriptor_words: None,
             flags: 0,
             nonuniform_handles: 0,
             threads: None,
@@ -219,6 +314,9 @@ impl Shader {
             lds: None,
             main,
             entry,
+            ops: std::collections::BTreeSet::new(),
+            view_index: std::collections::HashMap::new(),
+            view_write_ops: 0,
         }
     }
 
@@ -244,10 +342,18 @@ impl Shader {
         opcode: u32,
         args: &[V],
     ) -> V {
+        // bufferStore 69, atomicBinOp 78, atomicCompareExchange 79,
+        // rawBufferStore 140: a write through an unordered buffer view of
+        // the heap.
+        if matches!(opcode, 69 | 78 | 79 | 140) && args.first().is_some_and(|h| self.view_index.contains_key(h)) {
+            self.view_write_ops += 1;
+        }
         let mut params = vec![self.t.i32];
         params.extend(args.iter().map(|&a| self.m.type_of(a)));
         let fty = self.m.func_ty(ret, params);
         self.m.ptr(fty);
+        self.ops
+            .insert(name.split('.').next().unwrap_or(name).to_owned());
         let f = self
             .m
             .function(&format!("dx.op.{name}"), fty, Some(attr), false);
@@ -352,6 +458,48 @@ impl Shader {
         h
     }
 
+    /// The handle of the address map (`t0` in [`ADDRESS_MAP_SPACE`], a raw
+    /// buffer), made in the entry block.
+    pub fn address_map_handle(&mut self) -> V {
+        if let Some(h) = self.address_map {
+            return h;
+        }
+        let h = self.space_handle(ADDRESS_MAP_SPACE);
+        self.address_map = Some(h);
+        h
+    }
+
+    /// The handle of the descriptor words (`t0` in
+    /// [`DESCRIPTOR_WORDS_SPACE`], a raw buffer), made in the entry block.
+    pub fn descriptor_words_handle(&mut self) -> V {
+        if let Some(h) = self.descriptor_words {
+            return h;
+        }
+        let h = self.space_handle(DESCRIPTOR_WORDS_SPACE);
+        self.descriptor_words = Some(h);
+        h
+    }
+
+    /// A raw buffer bound at `t0` in `space`, made in the entry block.
+    fn space_handle(&mut self, space: u32) -> V {
+        let r = self.m.i32(0);
+        let bind = [r, r, self.m.i32(space), self.m.i8(0)];
+        let bind = self.m.aggregate(self.t.bind, &bind);
+        let f = self.m.bool(false);
+        let block = self.entry;
+        let h = self.op(
+            block,
+            "createHandleFromBinding",
+            Attr::ReadNone,
+            self.t.handle,
+            217,
+            &[bind, r, f],
+        );
+        let h = self.annotate(block, h, 11, 0);
+        self.flags |= flags::RAW_BUFFERS;
+        h
+    }
+
     /// The handle of immediate sampler `n` (a comparison sampler when its
     /// bit in `cmp_samplers` is set).
     pub fn sampler_handle(&mut self, block: usize, n: u32) -> V {
@@ -372,6 +520,33 @@ impl Shader {
             &[bind, i, f],
         );
         let cmp = if self.cmp_samplers >> n & 1 != 0 {
+            0x8000
+        } else {
+            0
+        };
+        self.annotate(block, h, 14 | cmp, 0)
+    }
+
+    /// The immediate sampler at `index` (a value) of the range of `count`
+    /// starting at register `first` ([`Shader::sampler_ranges`]).
+    pub fn sampler_range_handle(&mut self, block: usize, first: u32, count: u32, index: V) -> V {
+        let bind = [
+            self.m.i32(first),
+            self.m.i32(first + count - 1),
+            self.m.i32(SAMPLER_SPACE),
+            self.m.i8(3), // sampler
+        ];
+        let bind = self.m.aggregate(self.t.bind, &bind);
+        let f = self.m.bool(false);
+        let h = self.op(
+            block,
+            "createHandleFromBinding",
+            Attr::ReadNone,
+            self.t.handle,
+            217,
+            &[bind, index, f],
+        );
+        let cmp = if self.cmp_samplers >> first & 1 != 0 {
             0x8000
         } else {
             0
@@ -440,11 +615,23 @@ impl Shader {
             218,
             &[index, s, n],
         );
-        self.annotate(block, h, props.0, props.1)
+        let h = self.annotate(block, h, props.0, props.1);
+        // Unordered typed, raw and structured buffers (kinds 10-12).
+        if !sampler && props.0 & 0x1000 != 0 && (10..=12).contains(&(props.0 & 0xFF)) {
+            self.view_index.insert(h, index);
+        }
+        h
     }
 
     /// The finished container.
     pub fn finish(mut self) -> Vec<u8> {
+        let threads = self
+            .threads
+            .map_or(String::new(), |[x, y, z]| format!("threads {x}x{y}x{z}, "));
+        let wave = self.wave_size.map_or("any".to_owned(), |n| n.to_string());
+        let ops: Vec<&str> = self.ops.iter().map(String::as_str).collect();
+        let summary = format!("{threads}wave size {wave}; ops: {}", ops.join(", "));
+        LAST.with(|l| *l.borrow_mut() = summary);
         let ud_size = (self.user_data * 4).next_multiple_of(16);
         self.fix_user_data_size(ud_size);
         // The clean-up, before anything is declared about the code: a
@@ -478,6 +665,8 @@ impl Shader {
             || !self.root_cbvs.is_empty()
             || !self.root_srvs.is_empty()
             || !self.root_uavs.is_empty()
+            || self.address_map.is_some()
+            || self.descriptor_words.is_some()
         {
             let empty = self.m.md_str("");
             let mut cbvs = None;
@@ -503,6 +692,7 @@ impl Shader {
                     space: USER_DATA_SPACE,
                     register: 0,
                     dxil_kind: 13,
+                    count: 1,
                 });
             }
             let blob = self.m.array(16384, self.t.i32);
@@ -526,26 +716,40 @@ impl Shader {
                     space: ROOT_CBV_SPACE,
                     register: u32::from(slot),
                     dxil_kind: 13,
+                    count: 1,
                 });
             }
             if !cbv_list.is_empty() {
                 cbvs = Some(self.m.md_node(cbv_list));
             }
             let mut srvs = None;
-            if !self.root_srvs.is_empty() {
+            // Raw buffers: root SRVs, then the address map and the
+            // descriptor words.
+            let mut raw: Vec<(u32, u32)> = self
+                .root_srvs
+                .iter()
+                .map(|&(slot, _)| (ROOT_CBV_SPACE, u32::from(slot)))
+                .collect();
+            if self.address_map.is_some() {
+                raw.push((ADDRESS_MAP_SPACE, 0));
+            }
+            if self.descriptor_words.is_some() {
+                raw.push((DESCRIPTOR_WORDS_SPACE, 0));
+            }
+            if !raw.is_empty() {
                 let ty = self
                     .m
                     .named_struct("struct.ByteAddressBuffer", vec![self.t.i32]);
                 let p = self.m.ptr(ty);
                 let u = self.m.undef(p);
                 let mut list = Vec::new();
-                for (n, (slot, _)) in self.root_srvs.clone().into_iter().enumerate() {
+                for (n, (space, register)) in raw.into_iter().enumerate() {
                     let ops = vec![
                         Some(i32c(&mut self, n as u32)),
                         Some(self.m.md_value(u)),
                         Some(empty),
-                        Some(i32c(&mut self, ROOT_CBV_SPACE)),
-                        Some(i32c(&mut self, u32::from(slot))),
+                        Some(i32c(&mut self, space)),
+                        Some(i32c(&mut self, register)),
                         Some(i32c(&mut self, 1)),
                         Some(i32c(&mut self, 11)),
                         Some(i32c(&mut self, 0)),
@@ -554,15 +758,22 @@ impl Shader {
                     list.push(Some(self.m.md_node(ops)));
                     bindings.push(Binding {
                         kind: 4,
-                        space: ROOT_CBV_SPACE,
-                        register: u32::from(slot),
+                        space,
+                        register,
                         dxil_kind: 11,
+                        count: 1,
                     });
                 }
                 srvs = Some(self.m.md_node(list));
             }
             let mut uavs = None;
             if !self.root_uavs.is_empty() {
+                if self.mesh.is_some() || (self.threads.is_none() && !self.pixel) {
+                    self.flags |= flags::UAVS_AT_EVERY_STAGE;
+                }
+                if self.root_uavs.len() > 8 {
+                    self.flags |= flags::UAVS_64;
+                }
                 let ty = self
                     .m
                     .named_struct("struct.RWByteAddressBuffer", vec![self.t.i32]);
@@ -594,6 +805,7 @@ impl Shader {
                         space: ROOT_CBV_SPACE,
                         register: u32::from(slot),
                         dxil_kind: 11,
+                        count: 1,
                     });
                 }
                 uavs = Some(self.m.md_node(list));
@@ -604,15 +816,23 @@ impl Shader {
                 let p = self.m.ptr(ty);
                 let u = self.m.undef(p);
                 let mut list = Vec::new();
-                for n in 0..self.samplers {
+                let mut n = 0;
+                while n < self.samplers {
+                    // A range of samplers chosen among by control flow is
+                    // one entry; every other sampler is one of its own.
+                    let count = self
+                        .sampler_ranges
+                        .iter()
+                        .find(|r| r.0 == n)
+                        .map_or(1, |r| r.1);
                     let kind = (self.cmp_samplers >> n & 1) as u32;
                     let ops = vec![
-                        Some(i32c(&mut self, n)),
+                        Some(i32c(&mut self, list.len() as u32)),
                         Some(self.m.md_value(u)),
                         Some(empty),
                         Some(i32c(&mut self, SAMPLER_SPACE)),
                         Some(i32c(&mut self, n)),
-                        Some(i32c(&mut self, 1)),
+                        Some(i32c(&mut self, count)),
                         // Sampler kind: 1 comparison.
                         Some(i32c(&mut self, kind)),
                         None,
@@ -623,7 +843,9 @@ impl Shader {
                         space: SAMPLER_SPACE,
                         register: n,
                         dxil_kind: 14,
+                        count,
                     });
+                    n += count;
                 }
                 samplers = Some(self.m.md_node(list));
             }
@@ -640,6 +862,29 @@ impl Shader {
             self.m.named_md("dx.resources", vec![r]);
         }
 
+        // DXIL wants one interpolation mode per signature row: an input the
+        // program never reads takes the mode the read ones of its row share
+        // (the console may read a row centroid that DXC declared center).
+        if self.pixel {
+            let rows: std::collections::BTreeSet<u32> =
+                self.inputs.iter().filter_map(|e| e.row).collect();
+            for row in rows {
+                let mut read = self
+                    .inputs
+                    .iter()
+                    .filter(|e| e.row == Some(row) && e.usage != 0)
+                    .map(|e| e.interp);
+                let Some(mode) = read.next() else { continue };
+                if !read.all(|m| m == mode) {
+                    continue;
+                }
+                for e in self.inputs.iter_mut() {
+                    if e.row == Some(row) && e.usage == 0 {
+                        e.interp = mode;
+                    }
+                }
+            }
+        }
         let graphics = self.threads.is_none() || self.mesh.is_some();
         if graphics {
             // shortcut: every output is declared to depend on every input; the
@@ -752,7 +997,30 @@ impl Shader {
         let six = i32c(&mut self, 6);
         let version = self.m.md_node(vec![Some(one), Some(six)]);
         self.m.named_md("dx.version", vec![version]);
-        self.m.named_md("dx.valver", vec![version]);
+        // Validator 1.6 rules take gradient operations for pixel-only (the
+        // 1.8 validator, told 1.6, refuses a compute or mesh program that
+        // samples with implicit derivatives, which SM 6.6 allows): such
+        // programs ask for the 1.8 rules.
+        const GRADIENT: [&str; 9] = [
+            "sample",
+            "sampleBias",
+            "sampleCmp",
+            "sampleCmpBias",
+            "calculateLOD",
+            "derivCoarseX",
+            "derivCoarseY",
+            "derivFineX",
+            "derivFineY",
+        ];
+        let gradients =
+            self.threads.is_some() && self.ops.iter().any(|o| GRADIENT.contains(&o.as_str()));
+        let valver = if gradients {
+            let eight = i32c(&mut self, 8);
+            self.m.md_node(vec![Some(one), Some(eight)])
+        } else {
+            version
+        };
+        self.m.named_md("dx.valver", vec![valver]);
         // Program kinds: 0 pixel, 1 vertex, 2 geometry, 5 compute, 13 mesh.
         let (name, kind) = match (self.threads, self.pixel) {
             _ if self.mesh.is_some() => ("ms", 13u32),
@@ -780,6 +1048,12 @@ impl Shader {
         let mut features = 0u64;
         if self.flags & flags::DOUBLES != 0 {
             features |= 0x1;
+        }
+        if self.flags & flags::UAVS_AT_EVERY_STAGE != 0 {
+            features |= 0x4;
+        }
+        if self.flags & flags::UAVS_64 != 0 {
+            features |= 0x8;
         }
         if self.flags & flags::STENCIL_REF != 0 {
             features |= 0x200;
@@ -827,6 +1101,7 @@ impl Shader {
             bindings: &bindings,
             threads: self.threads.unwrap_or_default(),
             wave_size: self.wave_size,
+            v3: gradients,
         });
         let hash = [0u8; 20];
         let psg1 = container::signature(&self.prims, false);

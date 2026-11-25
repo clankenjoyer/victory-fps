@@ -156,7 +156,15 @@ struct Checks {
 /// translated into the run's shader cache, on `jobs` threads; nothing is
 /// made on the GPU. A run of the title then finds them there instead of
 /// translating each at its first use.
-pub fn warm(paths: Vec<PathBuf>, file: &Path, jobs: Option<usize>) -> Result<()> {
+pub fn warm(paths: Vec<PathBuf>, file: &Path, jobs: Option<usize>, host_lanes: Option<(u32, u32)>) -> Result<()> {
+    // The run sets the widest wave from the device; the same here, so that
+    // the cache key matches (`VICTORY_HOST_MAX_WAVE` / `VICTORY_HOST_WAVE` win).
+    if let Some((_, max)) = host_lanes
+        && std::env::var_os("VICTORY_HOST_MAX_WAVE").is_none()
+        && std::env::var_os("VICTORY_HOST_WAVE").is_none()
+    {
+        victory_shader::emit::set_host_max_wave(max);
+    }
     // `--warm all`: every container found, whatever its hash.
     let all = file.as_os_str() == "all";
     let mut wanted: HashSet<String> = HashSet::new();
@@ -210,7 +218,7 @@ pub fn warm(paths: Vec<PathBuf>, file: &Path, jobs: Option<usize>) -> Result<()>
                             if n.is_multiple_of(1000) {
                                 println!("warm-up      {n} shaders so far, {:.0} s", began.elapsed().as_secs_f64());
                             }
-                            let which = match victory_hle::modules::d3d12x::warm_shader(&bytes) {
+                            let which = match victory_hle::modules::d3d12x::warm_shader(&bytes, host_lanes) {
                                 Ok(true) => 0,
                                 Ok(false) => 1,
                                 Err(_) => 2,
@@ -239,6 +247,7 @@ pub fn run(
     pipelines: bool,
     list: bool,
     jobs: Option<usize>,
+    host_lanes: Option<(u32, u32)>,
 ) -> Result<()> {
     let paths = crate::default_paths(paths)?;
     // `VICTORY_HOST_MAX_WAVE=32`: translate as for a host whose waves have
@@ -255,8 +264,26 @@ pub fn run(
                 .map_or("dxil.dll".into(), |p| p.display().to_string())
         );
     }
+    let mut target = emit::Target::ANY;
     if pipelines {
-        Host::new(false).map_err(anyhow::Error::msg)?;
+        target = Host::new(false).map_err(anyhow::Error::msg)?.target();
+    }
+    if let Some((lanes_min, lanes_max)) = host_lanes {
+        target = emit::Target {
+            lanes_min,
+            lanes_max,
+        };
+    }
+    if target != emit::Target::ANY {
+        println!(
+            "host waves   {}-{} lanes",
+            target.lanes_min, target.lanes_max
+        );
+        // The forms for such a host follow the widest wave it runs, as the
+        // runtime sets it from the device (`VICTORY_HOST_MAX_WAVE` still wins).
+        if std::env::var_os("VICTORY_HOST_MAX_WAVE").is_none() {
+            victory_shader::emit::set_host_max_wave(target.lanes_max);
+        }
     }
     let pairs: Vec<(String, String)> = std::env::var("VICTORY_PAIRS")
         .unwrap_or_default()
@@ -682,7 +709,13 @@ fn check(
                     let _ = std::fs::write(format!("{name}.txt"), format!("{}\n{text}", label()));
                 }
             }
-            t.fail(format!("validator: {first}"), label);
+            // With what the module declares and calls: the validator's
+            // message for an operation the stage or the entry's properties
+            // do not allow names neither.
+            t.fail(
+                format!("validator: {first} [{}]", emit::last_module_summary()),
+                label,
+            );
         }
     }
 }

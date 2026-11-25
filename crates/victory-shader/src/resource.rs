@@ -46,6 +46,44 @@ pub const CODE: usize = usize::MAX;
 /// 64-bit address from the instruction's operands.
 pub const MEMORY: usize = usize::MAX - 1;
 
+/// [`MEMORY`] as the address-map forms (upstream PR #1198, the emitter's
+/// `lower/global.rs`) name it: there the lowering rebuilds the 64-bit
+/// address from the instruction's own operands and reads title memory
+/// through the address map. Used only for programs the default forms
+/// refuse ([`with_runtime_addresses`]).
+pub const GLOBAL: usize = MEMORY;
+
+thread_local! {
+    /// See [`with_runtime_addresses`].
+    static RUNTIME_ADDRESSES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `f` with tracking that takes every address only known when the
+/// program runs as [`GLOBAL`], in any stage (a pointer it loads, picks by
+/// control flow or computes, or one the title passes as plain data), and
+/// the BVH descriptor of `image_bvh*_intersect_ray` as data, as the
+/// address-map forms want. The emitter's fallback for programs the default
+/// forms refuse.
+pub fn with_runtime_addresses<R>(f: impl FnOnce() -> R) -> R {
+    let was = RUNTIME_ADDRESSES.replace(true);
+    let r = f();
+    RUNTIME_ADDRESSES.set(was);
+    r
+}
+
+/// Why an address has no root parameter, when the program computes it
+/// from values a translation can reproduce (the address-map forms).
+fn runtime_address(why: &str) -> bool {
+    matches!(
+        why,
+        "an address not from a root parameter"
+            | "an address from a phi"
+            | "an address loaded from memory"
+            | "an address with two computed terms"
+            | "an address from a root parameter that is no address"
+    )
+}
+
 /// The reasons an address traces to no root parameter for which the
 /// address is then taken as it stands ([`MEMORY`]).
 const RAW: [&str; 5] = [
@@ -251,6 +289,10 @@ pub fn track(
                 Ok(())
             };
             match &inst.fields {
+                // The address-map forms read the BVH descriptor as data (its
+                // base address and flags): no host view stands for it.
+                Fields::Image { .. }
+                    if inst.name().starts_with("image_bvh") && RUNTIME_ADDRESSES.get() => {}
                 Fields::Image { rsrc, .. } if inst.name().starts_with("image_bvh") => {
                     // The ray and node test names no texture. A descriptor
                     // whose flag dwords the code sets as numbers and whose
@@ -876,6 +918,13 @@ impl<'a> Tracer<'a> {
     /// says how it failed): title memory at the address as it stands, in a
     /// compute program.
     fn by_address(&self, why: &'static str) -> Result<Address, &'static str> {
+        if RUNTIME_ADDRESSES.get() && runtime_address(why) {
+            return Ok(Address {
+                param: MEMORY,
+                offset: 0,
+                dynamic: None,
+            });
+        }
         if self.stage == HwStage::Cs && RAW.contains(&why) {
             Ok(Address {
                 param: MEMORY,
@@ -1061,8 +1110,15 @@ impl<'a> Tracer<'a> {
         let Some(v) = dynamic else {
             return "a constant address";
         };
-        if self.inputs[v.0 as usize].is_some() {
-            return "an address in an SGPR that is no root parameter";
+        if let Some(reg) = self.inputs[v.0 as usize] {
+            // Other dwords of root constants are data the title sets, an
+            // address among them: the host has their value.
+            return match self.param_of(reg) {
+                Some((p, _)) if self.layout[p].root == RootType::Constants => {
+                    "an address from a root parameter that is no address"
+                }
+                _ => "an address in an SGPR that is no root parameter",
+            };
         }
         if self
             .leaves(v)

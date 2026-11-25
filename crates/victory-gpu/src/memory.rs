@@ -304,7 +304,8 @@ pub(crate) fn ready(
             shadow.refresh(list, start, len);
         }
         if writes && (first_write || n >= numbered) {
-            shadow.gpu_writes(list, start, len);
+            // Title memory by address: not marked.
+            shadow.gpu_writes(list, start, len, false);
         }
     }
     if first_read {

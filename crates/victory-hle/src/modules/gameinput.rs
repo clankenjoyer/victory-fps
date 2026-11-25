@@ -1146,6 +1146,12 @@ mod host {
             self.empty_until[slot] = None;
             #[allow(unused_mut)]
             let mut pad = convert(&state.Gamepad);
+            // A button of the real pad: the player has taken over, the
+            // scripted keys stop for the rest of the run.
+            #[cfg(feature = "diagnostics")]
+            if pad.buttons != 0 {
+                TAKEN_OVER.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
             // The scripted keys (`VICTORY_KEYS`) also press the first
             // pad's buttons, by the stand-in pad's table: with a real pad
             // connected the stand-in is not there, and a title that listens
@@ -1174,6 +1180,12 @@ mod host {
                     // SAFETY: plain queries.
                     .filter(|&vk| unsafe { GetAsyncKeyState(i32::from(vk)) } < 0)
                     .collect();
+                // A real key with our window in front: the player has taken
+                // over, the scripted keys stop for the rest of the run.
+                #[cfg(feature = "diagnostics")]
+                if !held.is_empty() {
+                    TAKEN_OVER.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
                 down.extend(held);
             }
             down.into_iter()
@@ -1202,8 +1214,17 @@ mod host {
     /// 0.2 s that long after input starts, with or without focus. A key is a
     /// letter, a digit, or `Enter`, `Esc`, `Tab`, `Back`, `Up`, `Down`,
     /// `Left`, `Right` (the stand-in pad's table maps them to buttons).
+    /// The player pressed a real key or pad button: [`scripted`] presses
+    /// nothing more. (The script pressed Enter every few seconds for the
+    /// whole run, over whatever the player did in the game.)
+    #[cfg(feature = "diagnostics")]
+    static TAKEN_OVER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
     #[cfg(feature = "diagnostics")]
     fn scripted() -> Vec<u8> {
+        if TAKEN_OVER.load(std::sync::atomic::Ordering::Relaxed) {
+            return Vec::new();
+        }
         static SCRIPT: LazyLock<(Instant, Vec<(Duration, u8)>)> = LazyLock::new(|| {
             let list = std::env::var("VICTORY_KEYS").unwrap_or_default();
             let keys = list.split(',').filter_map(|entry| {

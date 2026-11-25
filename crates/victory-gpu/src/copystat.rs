@@ -133,8 +133,56 @@ pub(crate) enum C {
     /// `watch::writes` askings not made because the range's first block is
     /// already known to be guarded view memory (no kernel call).
     WatchKnownView,
+    /// Refresh requests and `Shadow::update`s that returned at once, the
+    /// range checked already in the submission (`crate::stamp`), and their
+    /// bytes.
+    StampSkips,
+    StampSkipBytes,
+    /// Fault tracking (`crate::watch::fault`): writes taken by faults and
+    /// the microseconds of the handler; blocks made read-only (adopted or
+    /// guarded again) and made writable (faults, kernel writes); takes
+    /// (bitmap askings) and their microseconds; blocks adopted; blocks
+    /// turned volatile; blocks found written behind our back by the check,
+    /// and the check's microseconds.
+    FaultFaults,
+    FaultUs,
+    FaultProtected,
+    FaultUnprotected,
+    FaultTakes,
+    FaultTakeUs,
+    FaultAdopted,
+    FaultVolatile,
+    FaultStale,
+    FaultVerifyUs,
+    /// Copy-back on demand (`VICTORY_BACK_ON_DEMAND=1`): ranges declared
+    /// without a snapshot and their bytes; blocks copied at the title's
+    /// first write while flying, and those the pool had no room for;
+    /// blocks merged on demand, bytes written to title memory, and the
+    /// microseconds of those merges.
+    BackDemandRanges,
+    BackDemandBytes,
+    BackCows,
+    BackCowsLost,
+    BackDemandBlocks,
+    BackDemandWritten,
+    BackDemandUs,
+    /// Write marks (`VICTORY_VIEW_MARKS`, `crate::shadow::marks_on`): flights
+    /// whose marks were read when they landed, and those that landed
+    /// without (their ranges compared whole); pages marked; pieces of
+    /// copies in the card's memory the compare left out as unmarked, and
+    /// compared under marks; pieces of copies in the PC's memory left out
+    /// of the compare as unmarked, and compared; blocks of ranges copied
+    /// back on demand left out as unmarked.
+    MarksRead,
+    MarksUnread,
+    MarksPages,
+    MarksCardSkipped,
+    MarksCardCompared,
+    MarksPcSkipped,
+    MarksPcCompared,
+    MarksDemandSkipped,
 }
-const COUNTERS: usize = 80;
+const COUNTERS: usize = C::MarksDemandSkipped as usize + 1;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -984,6 +1032,9 @@ pub(crate) fn recorded(started: std::time::Instant) {
     let ns = started.elapsed().as_nanos() as u64;
     add(C::RecordCalls, 1);
     add(C::RecordNs, ns);
+    crate::framelog::add(crate::framelog::T::RecordCalls, 1);
+    crate::framelog::add(crate::framelog::T::RecordNs, ns);
+    crate::framelog::here(crate::framelog::H::RecordNs, ns);
     if !RECORDED_SINCE.load(Relaxed) && !RECORDED_SINCE.swap(true, Relaxed) {
         let began = now_us().saturating_sub(ns / 1000);
         add(C::UntilRecordUs, began.saturating_sub(PRESENTED_AT.load(Relaxed)));
@@ -997,6 +1048,12 @@ pub(crate) fn recorded(started: std::time::Instant) {
         return;
     }
     UNSENT.with(|u| u.set((0, 0)));
+    if crate::framelog::on() {
+        crate::framelog::add(crate::framelog::T::RecordLooks, 1);
+        if crate::framelog::on_slow_core() {
+            crate::framelog::add(crate::framelog::T::RecordSlow, 1);
+        }
+    }
     let id = thread_id();
     let mut all = RECORDERS.lock().unwrap_or_else(|e| e.into_inner());
     match all.iter_mut().find(|r| r.0 == id) {
@@ -1116,6 +1173,61 @@ pub(crate) fn log(frames: f64) {
         mb(c[C::TexHashed as usize]),
         mb(c[C::TexChanged as usize]),
     );
+    if crate::stamp::on() {
+        tracing::info!(
+            "refresh stamp per frame (VICTORY_REFRESH_STAMP=1): {:.0} requests skipped, {:.1} MB, as checked already in their submission",
+            c[C::StampSkips as usize],
+            mb(c[C::StampSkipBytes as usize]),
+        );
+    }
+    if crate::shadow::on_demand() {
+        tracing::info!(
+            "copy-back on demand per frame (VICTORY_BACK_ON_DEMAND=1): {:.0} ranges {:.1} MB declared without a snapshot; \
+             {:.1} blocks copied at the title's first write while flying ({:.1} found no room); \
+             {:.0} blocks merged on demand, {:.1} MB written to title memory, {:.2} ms",
+            c[C::BackDemandRanges as usize],
+            mb(c[C::BackDemandBytes as usize]),
+            c[C::BackCows as usize],
+            c[C::BackCowsLost as usize],
+            c[C::BackDemandBlocks as usize],
+            mb(c[C::BackDemandWritten as usize]),
+            ms(c[C::BackDemandUs as usize]),
+        );
+    }
+    if crate::shadow::marks_on() {
+        tracing::info!(
+            "write marks per frame (VICTORY_VIEW_MARKS=1): {:.1} flights' marks read ({:.1} landed without, compared whole); \
+             {:.0} pages marked; card copies: {:.0} pieces left out as unmarked, {:.0} compared; \
+             PC copies: {:.0} pieces left out as unmarked, {:.0} compared; {:.0} blocks on demand left out",
+            c[C::MarksRead as usize],
+            c[C::MarksUnread as usize],
+            c[C::MarksPages as usize],
+            c[C::MarksCardSkipped as usize],
+            c[C::MarksCardCompared as usize],
+            c[C::MarksPcSkipped as usize],
+            c[C::MarksPcCompared as usize],
+            c[C::MarksDemandSkipped as usize],
+        );
+    }
+    if crate::watch::fault::on() {
+        tracing::info!(
+            "fault tracking per frame (VICTORY_FAULT_TRACK=1): {:.0} faults {:.2} ms; {:.0} blocks made read-only ({:.0} adopted), \
+             {:.0} made writable; {:.0} takes {:.2} ms; {:.1} blocks turned volatile; {:.1} found written behind our back, check {:.2} ms; \
+             {} blocks ({} MB) tracked now",
+            c[C::FaultFaults as usize],
+            ms(c[C::FaultUs as usize]),
+            c[C::FaultProtected as usize],
+            c[C::FaultAdopted as usize],
+            c[C::FaultUnprotected as usize],
+            c[C::FaultTakes as usize],
+            ms(c[C::FaultTakeUs as usize]),
+            c[C::FaultVolatile as usize],
+            c[C::FaultStale as usize],
+            ms(c[C::FaultVerifyUs as usize]),
+            crate::watch::fault::tracked(),
+            (crate::watch::fault::tracked() * crate::watch::fault::BLOCK as u64) >> 20,
+        );
+    }
     tracing::info!(
         "recording per frame ({frames:.0} frames): {:.0} list calls {:.1} ms (all recording \
          threads); {:.1} ms waiting for pipelines; dynamic slots: {:.0} tables asked, {:.0} \
@@ -1272,9 +1384,11 @@ pub(crate) fn log(frames: f64) {
     }
     tracing::info!(
         "  write-watch askings per frame that failed in the kernel: {:.0}; not made because the range \
-         is known guarded view memory: {:.0} (VICTORY_VIEW_ASK=1 asks the kernel anyway)",
+         is known guarded view memory: {:.0} (VICTORY_VIEW_ASK=1 asks the kernel anyway); such ranges left \
+         out of the submissions' askings ahead: {:.0}",
         c[C::WatchFailed as usize],
         c[C::WatchKnownView as usize],
+        crate::watch::AHEAD_VIEWS.swap(0, Relaxed) as f64 / frames,
     );
     tracing::info!(
         "  waits for every earlier shader write, per frame: {:.0} for the title's barrier groups, {:.0} \
